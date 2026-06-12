@@ -32,6 +32,29 @@ nix develop -c cargo clippy --all-targets --locked -- -D warnings
 nix develop -c cargo test --locked
 ```
 
+## Release
+
+Releases publish to crates.io from `.github/workflows/release.yml` using crates.io
+Trusted Publishing. The `cctp` crate owner must configure this on crates.io
+before pushing a release tag:
+
+1. Open the `cctp` crate on crates.io.
+2. Go to Settings -> Trusted Publishing.
+3. Add a GitHub publisher with:
+   - Repository owner: `suchapalaver`
+   - Repository name: `cctp`
+   - Workflow filename: `release.yml`
+   - Environment: leave blank unless the GitHub workflow is updated to use one.
+
+To verify the workflow without publishing, run the Release workflow manually from
+GitHub Actions. The manual path runs tests, clippy, package listing, and
+`cargo publish --dry-run`; it skips the final publish step.
+
+To publish, bump `Cargo.toml`, commit the release, then push a `v*` tag. The tag
+workflow exchanges GitHub's OIDC token for a short-lived crates.io token and runs
+`cargo publish --locked`. After the first Trusted Publishing tag release
+succeeds, remove the old `CARGO_REGISTRY_TOKEN` repository secret from GitHub.
+
 ## Usage
 
 ```sh
