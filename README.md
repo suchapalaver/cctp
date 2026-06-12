@@ -16,6 +16,22 @@ cargo install cctp
 The source repository, published crate, and installed command are all named
 `cctp`.
 
+## Development
+
+This repository includes a Nix flake for a reproducible Rust development shell:
+
+```sh
+nix develop
+```
+
+Run the standard local checks through the shell:
+
+```sh
+nix develop -c cargo fmt -- --check
+nix develop -c cargo clippy --all-targets --locked -- -D warnings
+nix develop -c cargo test --locked
+```
+
 ## Usage
 
 ```sh
