@@ -106,6 +106,18 @@ To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
 The relay signer defaults to `--trezor-account`, but can be selected
 independently with `--relay-trezor-account`.
 
+## HyperEVM, Not HyperCore
+
+This CLI's first route is Ethereum mainnet -> HyperEVM. It does not implement
+HyperCore forwarding. The current bridge path is a normal EVM CCTP v2 transfer:
+it does not build hook payloads, does not target a HyperCore forwarder, and does
+not set a destination-caller requirement.
+
+If HyperCore support is added later, it should use a separate route/workflow type
+instead of extending the default HyperEVM workflow. That design needs to account
+for hook payload construction, forwarder recipient/caller requirements, and
+whether the shared `cctp-rs` layer should expose destination-caller control.
+
 Before any signing prompt, the CLI verifies both RPC providers report the
 expected chain IDs, resolves the CCTP contracts, and prints a bridge intent with
 the active Trezor account roles, derivation paths, chain bindings, addresses,
