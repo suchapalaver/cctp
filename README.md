@@ -115,6 +115,12 @@ destination MessageTransmitter, and relay policy. A live run requires typing
 without sending transactions, or `--yes` for explicit non-interactive
 automation.
 
+The bridge intent also prints provenance for high-impact configuration values,
+including route, amount, recipient, wallet accounts, relay mode, fast mode, fee
+cap, and RPC endpoint roles. RPC endpoints are redacted to scheme, port, and a
+masked host suffix so API keys in host labels, paths, usernames, passwords, or
+query strings are not shown.
+
 ## Configuration
 
 Configuration is treated as a service boundary. Raw CLI/env input is resolved

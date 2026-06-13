@@ -321,42 +321,99 @@ where
     fn bridge_config(&self, args: BridgeArgs) -> Result<BridgeConfig> {
         let file = BridgeConfigFile::read_optional(args.config.as_deref())?;
 
-        let from = args.from.or(file.from).unwrap_or(ChainArg::Ethereum);
-        let to = args.to.or(file.to).unwrap_or(ChainArg::HyperEvm);
-        let route = RouteConfig::new(from, to)?;
+        let cli_fast = args.fast;
+        let from = sourced_cli_file_default(
+            args.from,
+            "--from",
+            file.from,
+            "from",
+            ChainArg::Ethereum,
+            "ethereum",
+        );
+        let to = sourced_cli_file_default(
+            args.to,
+            "--to",
+            file.to,
+            "to",
+            ChainArg::HyperEvm,
+            "hyperevm",
+        );
+        let route = RouteConfig::new(from.value, to.value)?;
 
-        let amount = args
-            .amount
-            .or(file.amount)
-            .ok_or_else(|| eyre!("missing amount; set --amount or amount in the config file"))?;
+        let amount = sourced_required_cli_file(
+            args.amount,
+            "--amount",
+            file.amount,
+            "amount",
+            "missing amount; set --amount or amount in the config file",
+        )?;
 
-        let ethereum_rpc = args
-            .ethereum_rpc
-            .or_else(|| self.env.get(ETHEREUM_RPC_ENV))
-            .or(file.ethereum_rpc)
-            .ok_or_else(|| {
-                eyre!(
-                    "missing Ethereum RPC URL; set --ethereum-rpc, {ETHEREUM_RPC_ENV}, or ethereum_rpc in the config file"
-                )
-            })?;
-        let hyperevm_rpc = args
-            .hyperevm_rpc
-            .or_else(|| self.env.get(HYPEREVM_RPC_ENV))
-            .or(file.hyperevm_rpc)
-            .ok_or_else(|| {
-                eyre!(
-                    "missing HyperEVM RPC URL; set --hyperevm-rpc, {HYPEREVM_RPC_ENV}, or hyperevm_rpc in the config file"
-                )
-            })?;
+        let ethereum_rpc = sourced_required_cli_env_file(
+            args.ethereum_rpc,
+            "--ethereum-rpc",
+            self.env.get(ETHEREUM_RPC_ENV),
+            ETHEREUM_RPC_ENV,
+            file.ethereum_rpc,
+            "ethereum_rpc",
+            "missing Ethereum RPC URL; set --ethereum-rpc, ETHEREUM_RPC_URL, or ethereum_rpc in the config file",
+        )?;
+        let hyperevm_rpc = sourced_required_cli_env_file(
+            args.hyperevm_rpc,
+            "--hyperevm-rpc",
+            self.env.get(HYPEREVM_RPC_ENV),
+            HYPEREVM_RPC_ENV,
+            file.hyperevm_rpc,
+            "hyperevm_rpc",
+            "missing HyperEVM RPC URL; set --hyperevm-rpc, HYPEREVM_RPC_URL, or hyperevm_rpc in the config file",
+        )?;
 
-        let wallet = args.wallet.or(file.wallet).unwrap_or(WalletKind::Trezor);
-        let trezor_account = args.trezor_account.or(file.trezor_account).unwrap_or(0);
-        let self_relay = args.self_relay.or(file.self_relay).unwrap_or(false);
-        let fast = args.fast.or(file.fast).unwrap_or(false);
-        let max_fee_usdc = if !fast && args.fast == Some(false) {
-            args.max_fee_usdc
+        let wallet = sourced_cli_file_default(
+            args.wallet,
+            "--wallet",
+            file.wallet,
+            "wallet",
+            WalletKind::Trezor,
+            "trezor",
+        );
+        let trezor_account = sourced_cli_file_default(
+            args.trezor_account,
+            "--trezor-account",
+            file.trezor_account,
+            "trezor_account",
+            0,
+            "trezor account 0",
+        );
+        let relay_trezor_account = sourced_optional_cli_file(
+            args.relay_trezor_account,
+            "--relay-trezor-account",
+            file.relay_trezor_account,
+            "relay_trezor_account",
+        );
+        let self_relay = sourced_cli_file_default(
+            args.self_relay,
+            "--self-relay",
+            file.self_relay,
+            "self_relay",
+            false,
+            "wait for relayer",
+        );
+        let fast = sourced_cli_file_default(
+            args.fast,
+            "--fast",
+            file.fast,
+            "fast",
+            false,
+            "standard finality",
+        );
+        let max_fee_usdc = if !fast.value && cli_fast == Some(false) {
+            sourced_optional_cli_only(args.max_fee_usdc, "--max-fee-usdc")
         } else {
-            args.max_fee_usdc.or(file.max_fee_usdc)
+            sourced_optional_cli_file(
+                args.max_fee_usdc,
+                "--max-fee-usdc",
+                file.max_fee_usdc,
+                "max_fee_usdc",
+            )
         };
         let dry_run = args.dry_run.or(file.dry_run).unwrap_or(false);
         let receive_polling = ReceivePolling::new(
@@ -364,29 +421,62 @@ where
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
 
-        let source_wallet = WalletConfig::from_kind(wallet, trezor_account);
+        let source_wallet = WalletConfig::from_kind(wallet.value, trezor_account.value);
         source_wallet.validate()?;
         let relay_wallet = RelayWalletConfig::new(
-            self_relay,
-            wallet,
-            args.relay_trezor_account.or(file.relay_trezor_account),
-            trezor_account,
+            self_relay.value,
+            wallet.value,
+            relay_trezor_account.as_ref().map(|account| account.value),
+            trezor_account.value,
         );
         relay_wallet.validate()?;
+        let rpc = RpcEndpoints::parse(ethereum_rpc.value, hyperevm_rpc.value)?;
+        let transfer = transfer_request(
+            fast.value,
+            max_fee_usdc.as_ref().map(|max_fee| max_fee.value.as_str()),
+        )?;
+        let recipient =
+            sourced_optional_cli_file(args.recipient, "--recipient", file.recipient, "recipient");
+        let provenance = BridgeConfigProvenance {
+            route: RouteConfigProvenance {
+                from: from.source,
+                to: to.source,
+            },
+            amount: amount.source,
+            rpc: RpcEndpointsProvenance::from_rpc(&rpc, ethereum_rpc.source, hyperevm_rpc.source),
+            source_wallet: SourceWalletProvenance {
+                wallet: wallet.source,
+                account: trezor_account.source,
+            },
+            relay_wallet: RelayWalletProvenance::from_config(
+                self_relay.value,
+                relay_trezor_account.as_ref().map(|account| account.source),
+            ),
+            recipient: RecipientProvenance::from_source(
+                recipient.as_ref().map(|recipient| recipient.source),
+            ),
+            relay_mode: self_relay.source,
+            fast_mode: fast.source,
+            max_fee: max_fee_provenance(
+                &transfer,
+                max_fee_usdc.as_ref().map(|max_fee| max_fee.source),
+            )?,
+        };
 
         Ok(BridgeConfig {
             route,
-            amount: UsdcAmount::parse_decimal(&amount)?,
-            rpc: RpcEndpoints::parse(ethereum_rpc, hyperevm_rpc)?,
+            amount: UsdcAmount::parse_decimal(&amount.value)?,
+            rpc,
             source_wallet,
             relay_wallet,
-            recipient: RecipientConfig::from(args.recipient.or(file.recipient)),
+            recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
             usdc: args.usdc.or(file.usdc).unwrap_or(MAINNET_USDC),
-            transfer: transfer_request(fast, max_fee_usdc.as_deref())?,
-            relay: RelayMode::from_self_relay(self_relay),
+            transfer,
+            relay: RelayMode::from_self_relay(self_relay.value),
             receive_polling,
             dry_run,
             confirmation: ConfirmationPolicy::from_yes(args.yes),
+            provenance,
         })
     }
 }
@@ -425,6 +515,289 @@ impl BridgeConfigFile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigValueSource {
+    CliFlag(&'static str),
+    EnvVar(&'static str),
+    ConfigFile(&'static str),
+    Default(&'static str),
+}
+
+impl std::fmt::Display for ConfigValueSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CliFlag(flag) => write!(f, "CLI flag {flag}"),
+            Self::EnvVar(var) => write!(f, "env {var}"),
+            Self::ConfigFile(field) => write!(f, "config field {field}"),
+            Self::Default(label) => write!(f, "default {label}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Sourced<T> {
+    value: T,
+    source: ConfigValueSource,
+}
+
+impl<T> Sourced<T> {
+    const fn new(value: T, source: ConfigValueSource) -> Self {
+        Self { value, source }
+    }
+}
+
+fn sourced_cli_file_default<T>(
+    cli: Option<T>,
+    cli_flag: &'static str,
+    file: Option<T>,
+    file_field: &'static str,
+    default: T,
+    default_label: &'static str,
+) -> Sourced<T> {
+    if let Some(value) = cli {
+        return Sourced::new(value, ConfigValueSource::CliFlag(cli_flag));
+    }
+    if let Some(value) = file {
+        return Sourced::new(value, ConfigValueSource::ConfigFile(file_field));
+    }
+
+    Sourced::new(default, ConfigValueSource::Default(default_label))
+}
+
+fn sourced_optional_cli_file<T>(
+    cli: Option<T>,
+    cli_flag: &'static str,
+    file: Option<T>,
+    file_field: &'static str,
+) -> Option<Sourced<T>> {
+    if let Some(value) = cli {
+        return Some(Sourced::new(value, ConfigValueSource::CliFlag(cli_flag)));
+    }
+    file.map(|value| Sourced::new(value, ConfigValueSource::ConfigFile(file_field)))
+}
+
+fn sourced_optional_cli_only<T>(cli: Option<T>, cli_flag: &'static str) -> Option<Sourced<T>> {
+    cli.map(|value| Sourced::new(value, ConfigValueSource::CliFlag(cli_flag)))
+}
+
+fn sourced_required_cli_file<T>(
+    cli: Option<T>,
+    cli_flag: &'static str,
+    file: Option<T>,
+    file_field: &'static str,
+    missing_message: &'static str,
+) -> Result<Sourced<T>> {
+    sourced_optional_cli_file(cli, cli_flag, file, file_field).ok_or_else(|| eyre!(missing_message))
+}
+
+fn sourced_required_cli_env_file(
+    cli: Option<String>,
+    cli_flag: &'static str,
+    env: Option<String>,
+    env_var: &'static str,
+    file: Option<String>,
+    file_field: &'static str,
+    missing_message: &'static str,
+) -> Result<Sourced<String>> {
+    if let Some(value) = cli {
+        return Ok(Sourced::new(value, ConfigValueSource::CliFlag(cli_flag)));
+    }
+    if let Some(value) = env {
+        return Ok(Sourced::new(value, ConfigValueSource::EnvVar(env_var)));
+    }
+    if let Some(value) = file {
+        return Ok(Sourced::new(
+            value,
+            ConfigValueSource::ConfigFile(file_field),
+        ));
+    }
+
+    Err(eyre!(missing_message))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BridgeConfigProvenance {
+    route: RouteConfigProvenance,
+    amount: ConfigValueSource,
+    rpc: RpcEndpointsProvenance,
+    source_wallet: SourceWalletProvenance,
+    relay_wallet: RelayWalletProvenance,
+    recipient: RecipientProvenance,
+    relay_mode: ConfigValueSource,
+    fast_mode: ConfigValueSource,
+    max_fee: MaxFeeProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RouteConfigProvenance {
+    from: ConfigValueSource,
+    to: ConfigValueSource,
+}
+
+impl std::fmt::Display for RouteConfigProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "--from {}, --to {}", self.from, self.to)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcEndpointsProvenance {
+    source: RpcEndpointProvenance,
+    destination: RpcEndpointProvenance,
+}
+
+impl RpcEndpointsProvenance {
+    fn from_rpc(
+        rpc: &RpcEndpoints,
+        source: ConfigValueSource,
+        destination: ConfigValueSource,
+    ) -> Self {
+        Self {
+            source: RpcEndpointProvenance::from_url(source, &rpc.source),
+            destination: RpcEndpointProvenance::from_url(destination, &rpc.destination),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcEndpointProvenance {
+    source: ConfigValueSource,
+    redacted_endpoint: String,
+}
+
+impl RpcEndpointProvenance {
+    fn from_url(source: ConfigValueSource, url: &Url) -> Self {
+        Self {
+            source,
+            redacted_endpoint: redact_rpc_endpoint(url),
+        }
+    }
+}
+
+fn redact_rpc_endpoint(url: &Url) -> String {
+    match url.host_str() {
+        Some(host) => {
+            let host = redact_rpc_host(host);
+            match url.port() {
+                Some(port) => format!("{}://{host}:{port}/...", url.scheme()),
+                None => format!("{}://{host}/...", url.scheme()),
+            }
+        }
+        None => format!("{}://<redacted>/...", url.scheme()),
+    }
+}
+
+fn redact_rpc_host(host: &str) -> String {
+    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_owned();
+    }
+
+    let labels: Vec<&str> = host.split('.').collect();
+    match labels.as_slice() {
+        [] => "<redacted>".to_owned(),
+        [_] => "<redacted>".to_owned(),
+        [_, suffix @ ..] => format!("<redacted>.{}", suffix.join(".")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceWalletProvenance {
+    wallet: ConfigValueSource,
+    account: ConfigValueSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayWalletProvenance {
+    NotUsed,
+    ExplicitAccount { account: ConfigValueSource },
+    DefaultedToSourceAccount,
+}
+
+impl RelayWalletProvenance {
+    const fn from_config(self_relay: bool, relay_account: Option<ConfigValueSource>) -> Self {
+        if !self_relay {
+            return Self::NotUsed;
+        }
+
+        match relay_account {
+            Some(account) => Self::ExplicitAccount { account },
+            None => Self::DefaultedToSourceAccount,
+        }
+    }
+}
+
+impl std::fmt::Display for RelayWalletProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotUsed => f.write_str("not used"),
+            Self::ExplicitAccount { account } => write!(f, "account from {account}"),
+            Self::DefaultedToSourceAccount => f.write_str("defaulted to source account"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecipientProvenance {
+    Explicit { source: ConfigValueSource },
+    DefaultedToSourceSigner,
+}
+
+impl RecipientProvenance {
+    const fn from_source(source: Option<ConfigValueSource>) -> Self {
+        match source {
+            Some(source) => Self::Explicit { source },
+            None => Self::DefaultedToSourceSigner,
+        }
+    }
+}
+
+impl std::fmt::Display for RecipientProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Explicit { source } => write!(f, "explicit from {source}"),
+            Self::DefaultedToSourceSigner => f.write_str("defaulted to source signer"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaxFeeProvenance {
+    NotApplicable,
+    Manual { source: ConfigValueSource },
+    AutoResolved { source: ConfigValueSource },
+}
+
+impl std::fmt::Display for MaxFeeProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplicable => f.write_str("not applicable"),
+            Self::Manual { source } => write!(f, "manual cap from {source}"),
+            Self::AutoResolved { source } => write!(f, "auto-resolved cap from {source}"),
+        }
+    }
+}
+
+fn max_fee_provenance(
+    transfer: &TransferRequest,
+    manual_max_fee: Option<ConfigValueSource>,
+) -> Result<MaxFeeProvenance> {
+    Ok(match transfer {
+        TransferRequest::Standard => MaxFeeProvenance::NotApplicable,
+        TransferRequest::Fast {
+            manual_max_fee: Some(_),
+        } => MaxFeeProvenance::Manual {
+            source: manual_max_fee.ok_or_else(|| {
+                eyre!("internal error: manual fast fee cap is missing provenance")
+            })?,
+        },
+        TransferRequest::Fast {
+            manual_max_fee: None,
+        } => MaxFeeProvenance::AutoResolved {
+            source: ConfigValueSource::Default("live fee + 20% buffer"),
+        },
+    })
+}
+
 #[derive(Clone, Debug)]
 struct BridgeConfig {
     route: RouteConfig,
@@ -439,6 +812,7 @@ struct BridgeConfig {
     receive_polling: ReceivePolling,
     dry_run: bool,
     confirmation: ConfirmationPolicy,
+    provenance: BridgeConfigProvenance,
 }
 
 #[derive(Clone, Debug)]
@@ -1562,6 +1936,7 @@ struct BridgeIntent {
     relay_account: Option<WalletAccount>,
     provider_validation: ProviderValidation,
     contracts: BridgeContracts,
+    provenance: BridgeConfigProvenance,
 }
 
 impl BridgeIntent {
@@ -1585,6 +1960,7 @@ impl BridgeIntent {
             relay_account,
             provider_validation,
             contracts,
+            provenance: config.provenance.clone(),
         }
     }
 }
@@ -1595,17 +1971,37 @@ struct HumanReporter;
 impl HumanReporter {
     fn report_intent(self, intent: &BridgeIntent) {
         println!("Bridge intent");
-        println!("Route: {}", intent.route);
-        self.report_provider_check(&intent.provider_validation.source);
-        self.report_provider_check(&intent.provider_validation.destination);
+        println!("Route: {} ({})", intent.route, intent.provenance.route);
+        self.report_provider_check(
+            &intent.provider_validation.source,
+            &intent.provenance.rpc.source,
+        );
+        self.report_provider_check(
+            &intent.provider_validation.destination,
+            &intent.provenance.rpc.destination,
+        );
         self.report_wallet_account("Source", &intent.source_account);
-        println!("Recipient: {}", intent.recipient);
+        println!(
+            "Source wallet source: wallet {}, account {}",
+            intent.provenance.source_wallet.wallet, intent.provenance.source_wallet.account
+        );
+        println!(
+            "Recipient: {} ({})",
+            intent.recipient, intent.provenance.recipient
+        );
         println!("USDC: {}", intent.usdc);
-        println!("Amount: {} USDC", intent.amount);
-        self.report_transfer_mode(&intent.transfer);
-        println!("Relay: {}", intent.relay);
+        println!(
+            "Amount: {} USDC ({})",
+            intent.amount, intent.provenance.amount
+        );
+        self.report_transfer_mode(&intent.transfer, intent.provenance.fast_mode);
+        println!("Fee cap source: {}", intent.provenance.max_fee);
+        println!("Relay: {} ({})", intent.relay, intent.provenance.relay_mode);
         match intent.relay_account {
-            Some(account) => self.report_wallet_account("Relay", &account),
+            Some(account) => {
+                self.report_wallet_account("Relay", &account);
+                println!("Relay wallet source: {}", intent.provenance.relay_wallet);
+            }
             None => println!("Destination provider: read-only"),
         }
         println!(
@@ -1622,12 +2018,14 @@ impl HumanReporter {
         );
     }
 
-    fn report_provider_check(self, check: &ProviderChainCheck) {
+    fn report_provider_check(self, check: &ProviderChainCheck, endpoint: &RpcEndpointProvenance) {
         println!(
-            "{} verified: {} (chain id {})",
+            "{} verified: {} (chain id {}, endpoint {}, {})",
             check.role.report_label(),
             check.chain_label,
-            check.actual_chain_id
+            check.actual_chain_id,
+            endpoint.redacted_endpoint,
+            endpoint.source
         );
     }
 
@@ -1642,8 +2040,12 @@ impl HumanReporter {
         println!("{label} address: {}", account.address);
     }
 
-    fn report_transfer_mode(self, transfer: &ResolvedTransferMode) {
-        println!("Mode: {}", mode_label(&transfer.mode));
+    fn report_transfer_mode(self, transfer: &ResolvedTransferMode, fast_source: ConfigValueSource) {
+        println!(
+            "Mode: {} (fast mode {})",
+            mode_label(&transfer.mode),
+            fast_source
+        );
         if let TransferFeeResolution::Fast(fee) = transfer.fee {
             println!(
                 "Fast live fee: {} bps ({} USDC for this amount)",
@@ -1833,6 +2235,45 @@ mod tests {
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.confirmation, ConfirmationPolicy::RequireInteractive);
+        assert_eq!(
+            config.provenance.route,
+            RouteConfigProvenance {
+                from: ConfigValueSource::CliFlag("--from"),
+                to: ConfigValueSource::CliFlag("--to")
+            }
+        );
+        assert_eq!(
+            config.provenance.recipient,
+            RecipientProvenance::DefaultedToSourceSigner
+        );
+        assert_eq!(
+            config.provenance.amount,
+            ConfigValueSource::CliFlag("--amount")
+        );
+        assert_eq!(
+            config.provenance.rpc.source.source,
+            ConfigValueSource::CliFlag("--ethereum-rpc")
+        );
+        assert_eq!(
+            config.provenance.rpc.destination.source,
+            ConfigValueSource::CliFlag("--hyperevm-rpc")
+        );
+        assert_eq!(
+            config.provenance.source_wallet,
+            SourceWalletProvenance {
+                wallet: ConfigValueSource::CliFlag("--wallet"),
+                account: ConfigValueSource::CliFlag("--trezor-account")
+            }
+        );
+        assert_eq!(
+            config.provenance.relay_wallet,
+            RelayWalletProvenance::NotUsed
+        );
+        assert_eq!(
+            config.provenance.fast_mode,
+            ConfigValueSource::Default("standard finality")
+        );
+        assert_eq!(config.provenance.max_fee, MaxFeeProvenance::NotApplicable);
     }
 
     #[test]
@@ -1856,6 +2297,16 @@ mod tests {
                 manual_max_fee: None
             }
         );
+        assert_eq!(
+            config.provenance.fast_mode,
+            ConfigValueSource::CliFlag("--fast")
+        );
+        assert_eq!(
+            config.provenance.max_fee,
+            MaxFeeProvenance::AutoResolved {
+                source: ConfigValueSource::Default("live fee + 20% buffer")
+            }
+        );
     }
 
     #[test]
@@ -1869,6 +2320,12 @@ mod tests {
             config.transfer,
             TransferRequest::Fast {
                 manual_max_fee: Some(UsdcAmount::from_atomic(U256::from(10_000u64)))
+            }
+        );
+        assert_eq!(
+            config.provenance.max_fee,
+            MaxFeeProvenance::Manual {
+                source: ConfigValueSource::CliFlag("--max-fee-usdc")
             }
         );
     }
@@ -2067,6 +2524,37 @@ receive_interval_secs = 7
                 interval_secs: Some(7)
             }
         );
+        assert_eq!(
+            config.provenance.route,
+            RouteConfigProvenance {
+                from: ConfigValueSource::Default("ethereum"),
+                to: ConfigValueSource::Default("hyperevm")
+            }
+        );
+        assert_eq!(
+            config.provenance.recipient,
+            RecipientProvenance::Explicit {
+                source: ConfigValueSource::ConfigFile("recipient")
+            }
+        );
+        assert_eq!(
+            config.provenance.rpc.source.source,
+            ConfigValueSource::ConfigFile("ethereum_rpc")
+        );
+        assert_eq!(
+            config.provenance.source_wallet.account,
+            ConfigValueSource::ConfigFile("trezor_account")
+        );
+        assert_eq!(
+            config.provenance.relay_wallet,
+            RelayWalletProvenance::ExplicitAccount {
+                account: ConfigValueSource::ConfigFile("relay_trezor_account")
+            }
+        );
+        assert_eq!(
+            config.provenance.relay_mode,
+            ConfigValueSource::ConfigFile("self_relay")
+        );
     }
 
     #[test]
@@ -2100,6 +2588,33 @@ dry_run = true
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert!(config.dry_run);
+        assert_eq!(
+            config.provenance.amount,
+            ConfigValueSource::CliFlag("--amount")
+        );
+        assert_eq!(
+            config.provenance.rpc.source.source,
+            ConfigValueSource::CliFlag("--ethereum-rpc")
+        );
+        assert_eq!(
+            config.provenance.rpc.destination.source,
+            ConfigValueSource::EnvVar(HYPEREVM_RPC_ENV)
+        );
+        assert_eq!(
+            config.provenance.source_wallet,
+            SourceWalletProvenance {
+                wallet: ConfigValueSource::Default("trezor"),
+                account: ConfigValueSource::CliFlag("--trezor-account")
+            }
+        );
+        assert_eq!(
+            config.provenance.relay_mode,
+            ConfigValueSource::Default("wait for relayer")
+        );
+        assert_eq!(
+            config.provenance.fast_mode,
+            ConfigValueSource::Default("standard finality")
+        );
     }
 
     #[test]
@@ -2127,6 +2642,11 @@ dry_run = true
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert!(!config.dry_run);
+        assert_eq!(
+            config.provenance.fast_mode,
+            ConfigValueSource::CliFlag("--fast")
+        );
+        assert_eq!(config.provenance.max_fee, MaxFeeProvenance::NotApplicable);
     }
 
     #[test]
@@ -2163,6 +2683,29 @@ hyperevm_rpc = "https://file.hyperevm.example"
             config.rpc.destination.as_str(),
             "https://env.hyperevm.example/"
         );
+        assert_eq!(
+            config.provenance.rpc.source.source,
+            ConfigValueSource::EnvVar(ETHEREUM_RPC_ENV)
+        );
+        assert_eq!(
+            config.provenance.rpc.destination.source,
+            ConfigValueSource::EnvVar(HYPEREVM_RPC_ENV)
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_provenance_redacts_secret_url_parts() {
+        let url: Url = "https://user:password@rpc.example:8545/v3/secret-key?api-key=secret"
+            .parse()
+            .expect("valid URL");
+
+        let redacted = redact_rpc_endpoint(&url);
+
+        assert_eq!(redacted, "https://<redacted>.example:8545/...");
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("api-key"));
     }
 
     #[test]
@@ -2316,6 +2859,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         assert_eq!(intent.provider_validation, provider_validation);
         assert_eq!(intent.contracts, contracts);
         assert_eq!(intent.transfer, ResolvedTransferMode::standard());
+        assert_eq!(intent.provenance, config.provenance);
     }
 
     #[test]
