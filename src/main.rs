@@ -39,7 +39,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Bridge USDC from Ethereum mainnet to HyperEVM.
+    /// Bridge USDC over a supported CCTP route.
     Bridge(BridgeArgs),
 }
 
@@ -49,11 +49,11 @@ struct BridgeArgs {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Source chain. The first implementation supports ethereum only.
+    /// Source chain.
     #[arg(long)]
     from: Option<ChainArg>,
 
-    /// Destination chain. The first implementation supports hyperevm only.
+    /// Destination chain.
     #[arg(long)]
     to: Option<ChainArg>,
 
@@ -81,13 +81,13 @@ struct BridgeArgs {
     #[arg(long)]
     trezor_account: Option<u32>,
 
-    /// Trezor Live account index used only for --self-relay on HyperEVM.
+    /// Trezor Live account index used only for --self-relay on the destination chain.
     ///
     /// Defaults to --trezor-account when omitted.
     #[arg(long)]
     relay_trezor_account: Option<u32>,
 
-    /// Override the Ethereum mainnet USDC address.
+    /// Override the source-chain USDC address.
     #[arg(long)]
     usdc: Option<Address>,
 
@@ -107,10 +107,10 @@ struct BridgeArgs {
     #[arg(long)]
     max_fee_usdc: Option<String>,
 
-    /// Submit receiveMessage from the Trezor account on HyperEVM.
+    /// Submit receiveMessage from the Trezor account on the destination chain.
     ///
     /// Without this flag the CLI waits for any permissionless relayer to complete
-    /// the mint, which avoids requiring HyperEVM gas in the Trezor account.
+    /// the mint, which avoids requiring destination-chain gas in the Trezor account.
     #[arg(
         long,
         default_missing_value = "true",
@@ -338,7 +338,7 @@ where
             ChainArg::HyperEvm,
             "hyperevm",
         );
-        let route = RouteConfig::new(from.value, to.value)?;
+        let route = ROUTE_CATALOG.resolve(from.value, to.value)?;
 
         let amount = sourced_required_cli_file(
             args.amount,
@@ -430,7 +430,11 @@ where
             trezor_account.value,
         );
         relay_wallet.validate()?;
-        let rpc = RpcEndpoints::parse(ethereum_rpc.value, hyperevm_rpc.value)?;
+        let rpc_sources = ChainRpcEndpointSources {
+            ethereum: ethereum_rpc.source,
+            hyperevm: hyperevm_rpc.source,
+        };
+        let rpc = RpcEndpoints::parse(&route, ethereum_rpc.value, hyperevm_rpc.value)?;
         let transfer = transfer_request(
             fast.value,
             max_fee_usdc.as_ref().map(|max_fee| max_fee.value.as_str()),
@@ -443,7 +447,7 @@ where
                 to: to.source,
             },
             amount: amount.source,
-            rpc: RpcEndpointsProvenance::from_rpc(&rpc, ethereum_rpc.source, hyperevm_rpc.source),
+            rpc: RpcEndpointsProvenance::from_rpc(&route, &rpc, rpc_sources),
             source_wallet: SourceWalletProvenance {
                 wallet: wallet.source,
                 account: trezor_account.source,
@@ -470,7 +474,7 @@ where
             source_wallet,
             relay_wallet,
             recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
-            usdc: args.usdc.or(file.usdc).unwrap_or(MAINNET_USDC),
+            usdc: args.usdc.or(file.usdc).unwrap_or(route.default_usdc()),
             transfer,
             relay: RelayMode::from_self_relay(self_relay.value),
             receive_polling,
@@ -647,14 +651,13 @@ struct RpcEndpointsProvenance {
 }
 
 impl RpcEndpointsProvenance {
-    fn from_rpc(
-        rpc: &RpcEndpoints,
-        source: ConfigValueSource,
-        destination: ConfigValueSource,
-    ) -> Self {
+    fn from_rpc(route: &RouteConfig, rpc: &RpcEndpoints, sources: ChainRpcEndpointSources) -> Self {
         Self {
-            source: RpcEndpointProvenance::from_url(source, &rpc.source),
-            destination: RpcEndpointProvenance::from_url(destination, &rpc.destination),
+            source: RpcEndpointProvenance::from_url(sources.for_chain(route.from()), &rpc.source),
+            destination: RpcEndpointProvenance::from_url(
+                sources.for_chain(route.to()),
+                &rpc.destination,
+            ),
         }
     }
 }
@@ -958,7 +961,7 @@ where
                         self.config.receive_polling.interval_secs,
                     )
                     .await
-                    .wrap_err("timed out waiting for HyperEVM receive status")?;
+                    .wrap_err("timed out waiting for destination receive status")?;
                 CompletionOutcome::RelayerCompleted
             }
             RelayMode::SelfRelay => {
@@ -969,7 +972,7 @@ where
                     .runtime
                     .mint_if_needed(message, attestation, relay_submitter)
                     .await
-                    .wrap_err("failed to self-relay CCTP mint on HyperEVM")?
+                    .wrap_err("failed to self-relay CCTP mint on destination chain")?
                 {
                     MintResult::Minted(tx_hash) => {
                         self.runtime
@@ -1161,23 +1164,22 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RouteConfig {
     route: CctpV2Route,
+    from: ChainArg,
+    to: ChainArg,
     source_label: &'static str,
     destination_label: &'static str,
+    default_usdc: Address,
 }
 
 impl RouteConfig {
-    fn new(from: ChainArg, to: ChainArg) -> Result<Self> {
-        if from != ChainArg::Ethereum || to != ChainArg::HyperEvm {
-            bail!("only --from ethereum --to hyperevm is supported in this first CLI version");
-        }
-
-        let source = from.named_chain();
-        let destination = to.named_chain();
-
+    fn from_supported(route: SupportedRoute) -> Result<Self> {
         Ok(Self {
-            route: CctpV2Route::new(source, destination)?,
-            source_label: chain_label(from),
-            destination_label: chain_label(to),
+            route: CctpV2Route::new(route.source_chain(), route.destination_chain())?,
+            from: route.from,
+            to: route.to,
+            source_label: route.source_label,
+            destination_label: route.destination_label,
+            default_usdc: route.default_usdc,
         })
     }
 
@@ -1193,12 +1195,24 @@ impl RouteConfig {
         self.route
     }
 
+    const fn from(&self) -> ChainArg {
+        self.from
+    }
+
+    const fn to(&self) -> ChainArg {
+        self.to
+    }
+
     const fn source_label(&self) -> &'static str {
         self.source_label
     }
 
     const fn destination_label(&self) -> &'static str {
         self.destination_label
+    }
+
+    const fn default_usdc(&self) -> Address {
+        self.default_usdc
     }
 }
 
@@ -1208,10 +1222,73 @@ impl std::fmt::Display for RouteConfig {
     }
 }
 
-const fn chain_label(chain: ChainArg) -> &'static str {
-    match chain {
-        ChainArg::Ethereum => "Ethereum mainnet",
-        ChainArg::HyperEvm => "HyperEVM",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SupportedRoute {
+    from: ChainArg,
+    to: ChainArg,
+    source_label: &'static str,
+    destination_label: &'static str,
+    default_usdc: Address,
+}
+
+impl SupportedRoute {
+    fn matches(self, from: ChainArg, to: ChainArg) -> bool {
+        self.from == from && self.to == to
+    }
+
+    const fn source_chain(self) -> NamedChain {
+        self.from.named_chain()
+    }
+
+    const fn destination_chain(self) -> NamedChain {
+        self.to.named_chain()
+    }
+
+    fn cli_pair(self) -> String {
+        format!("{} -> {}", self.from, self.to)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteCatalog;
+
+const ROUTE_CATALOG: RouteCatalog = RouteCatalog;
+
+const SUPPORTED_ROUTES: &[SupportedRoute] = &[SupportedRoute {
+    from: ChainArg::Ethereum,
+    to: ChainArg::HyperEvm,
+    source_label: "Ethereum mainnet",
+    destination_label: "HyperEVM",
+    default_usdc: MAINNET_USDC,
+}];
+
+impl RouteCatalog {
+    fn resolve(&self, from: ChainArg, to: ChainArg) -> Result<RouteConfig> {
+        let supported = self
+            .supported_routes()
+            .iter()
+            .copied()
+            .find(|route| route.matches(from, to))
+            .ok_or_else(|| {
+                eyre!(
+                    "unsupported route {from} -> {to}; supported routes: {}",
+                    self.supported_routes_description()
+                )
+            })?;
+
+        RouteConfig::from_supported(supported)
+    }
+
+    const fn supported_routes(&self) -> &'static [SupportedRoute] {
+        SUPPORTED_ROUTES
+    }
+
+    fn supported_routes_description(&self) -> String {
+        self.supported_routes()
+            .iter()
+            .map(|route| route.cli_pair())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1222,15 +1299,50 @@ struct RpcEndpoints {
 }
 
 impl RpcEndpoints {
-    fn parse(ethereum_rpc: String, hyperevm_rpc: String) -> Result<Self> {
-        Ok(Self {
-            source: ethereum_rpc
+    fn parse(route: &RouteConfig, ethereum_rpc: String, hyperevm_rpc: String) -> Result<Self> {
+        let endpoints = ChainRpcEndpoints {
+            ethereum: ethereum_rpc
                 .parse()
                 .wrap_err("failed to parse --ethereum-rpc as a URL")?,
-            destination: hyperevm_rpc
+            hyperevm: hyperevm_rpc
                 .parse()
                 .wrap_err("failed to parse --hyperevm-rpc as a URL")?,
+        };
+
+        Ok(Self {
+            source: endpoints.for_chain(route.from()),
+            destination: endpoints.for_chain(route.to()),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChainRpcEndpoints {
+    ethereum: Url,
+    hyperevm: Url,
+}
+
+impl ChainRpcEndpoints {
+    fn for_chain(&self, chain: ChainArg) -> Url {
+        match chain {
+            ChainArg::Ethereum => self.ethereum.clone(),
+            ChainArg::HyperEvm => self.hyperevm.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChainRpcEndpointSources {
+    ethereum: ConfigValueSource,
+    hyperevm: ConfigValueSource,
+}
+
+impl ChainRpcEndpointSources {
+    const fn for_chain(self, chain: ChainArg) -> ConfigValueSource {
+        match chain {
+            ChainArg::Ethereum => self.ethereum,
+            ChainArg::HyperEvm => self.hyperevm,
+        }
     }
 }
 
@@ -1278,7 +1390,7 @@ impl std::fmt::Display for RelayMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WaitForRelayer => f.write_str("wait for any permissionless relayer"),
-            Self::SelfRelay => f.write_str("self-relay on HyperEVM"),
+            Self::SelfRelay => f.write_str("self-relay on destination chain"),
         }
     }
 }
@@ -1683,11 +1795,18 @@ impl WalletService for TrezorWalletService {
             .source_wallet
             .trezor_signer(config.route.source_chain_id())
             .await
-            .wrap_err("failed to initialize Trezor signer for Ethereum mainnet")?;
-        let address = signer
-            .get_address()
-            .await
-            .wrap_err("failed to read Ethereum address from Trezor")?;
+            .wrap_err_with(|| {
+                format!(
+                    "failed to initialize Trezor signer for {}",
+                    config.route.source_label()
+                )
+            })?;
+        let address = signer.get_address().await.wrap_err_with(|| {
+            format!(
+                "failed to read {} address from Trezor",
+                config.route.source_label()
+            )
+        })?;
         let account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
@@ -1706,11 +1825,18 @@ impl WalletService for TrezorWalletService {
         let signer = wallet
             .trezor_signer(config.route.destination_chain_id())
             .await
-            .wrap_err("failed to initialize Trezor signer for HyperEVM self-relay")?;
-        let address = signer
-            .get_address()
-            .await
-            .wrap_err("failed to read HyperEVM relay address from Trezor")?;
+            .wrap_err_with(|| {
+                format!(
+                    "failed to initialize Trezor signer for {} self-relay",
+                    config.route.destination_label()
+                )
+            })?;
+        let address = signer.get_address().await.wrap_err_with(|| {
+            format!(
+                "failed to read {} relay address from Trezor",
+                config.route.destination_label()
+            )
+        })?;
         let account = wallet.account_info(
             WalletRole::DestinationRelay,
             config.route.destination_label(),
@@ -2277,11 +2403,55 @@ mod tests {
     }
 
     #[test]
-    fn config_service_rejects_unsupported_route() {
-        let mut args = sample_args();
+    fn route_catalog_resolves_supported_route() {
+        let route = supported_route_config();
+
+        assert_eq!(route.cctp_route().source_chain(), NamedChain::Mainnet);
+        assert_eq!(
+            route.cctp_route().destination_chain(),
+            NamedChain::Hyperliquid
+        );
+        assert_eq!(route.source_label(), "Ethereum mainnet");
+        assert_eq!(route.destination_label(), "HyperEVM");
+        assert_eq!(route.default_usdc(), MAINNET_USDC);
+    }
+
+    #[test]
+    fn route_catalog_lists_supported_routes_on_rejection() {
+        let error = ROUTE_CATALOG
+            .resolve(ChainArg::HyperEvm, ChainArg::Ethereum)
+            .expect_err("unsupported route is invalid");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("unsupported route hyperevm -> ethereum"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("supported routes: ethereum -> hyperevm"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn config_service_rejects_unsupported_route_before_required_inputs() {
+        let mut args = empty_args();
+        args.from = Some(ChainArg::HyperEvm);
         args.to = Some(ChainArg::Ethereum);
 
-        assert!(empty_service().bridge_config(args).is_err());
+        let error = empty_service()
+            .bridge_config(args)
+            .expect_err("unsupported route is invalid");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("unsupported route hyperevm -> ethereum"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("missing amount"),
+            "route policy should fail before later config checks: {message}"
+        );
     }
 
     #[test]
@@ -2731,7 +2901,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
     #[test]
     fn provider_validation_accepts_expected_chain_ids() {
-        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+        let route = supported_route_config();
 
         let validation =
             ProviderValidation::new(route, route.source_chain_id(), route.destination_chain_id())
@@ -2759,7 +2929,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
     #[test]
     fn provider_validation_rejects_source_chain_mismatch_with_route_context() {
-        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+        let route = supported_route_config();
 
         let error = ProviderValidation::new(route, 31_337, route.destination_chain_id())
             .expect_err("source mismatch is invalid");
@@ -2782,7 +2952,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
     #[test]
     fn provider_validation_rejects_destination_chain_mismatch_with_route_context() {
-        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+        let route = supported_route_config();
 
         let error = ProviderValidation::new(route, route.source_chain_id(), 31_337)
             .expect_err("destination mismatch is invalid");
@@ -2974,6 +3144,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
     fn tx_hash(byte: u8) -> TxHash {
         TxHash::from([byte; 32])
+    }
+
+    fn supported_route_config() -> RouteConfig {
+        ROUTE_CATALOG
+            .resolve(ChainArg::Ethereum, ChainArg::HyperEvm)
+            .expect("supported route")
     }
 
     fn mock_workflow(

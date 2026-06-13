@@ -106,6 +106,14 @@ To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
 The relay signer defaults to `--trezor-account`, but can be selected
 independently with `--relay-trezor-account`.
 
+Supported routes are explicit CLI catalog entries:
+
+| From | To | Notes |
+| --- | --- | --- |
+| `ethereum` | `hyperevm` | Ethereum mainnet to HyperEVM CCTP v2. |
+
+Unsupported routes fail during config resolution before wallet initialization.
+
 ## HyperEVM, Not HyperCore
 
 This CLI's first route is Ethereum mainnet -> HyperEVM. It does not implement
@@ -171,7 +179,9 @@ Local config files can contain RPC URLs with API keys. Keep those files local:
 `cctp.toml`, `cctp.local.toml`, `*.local.toml`, `.env`, and `.env.*` are ignored
 by git. Commit only sanitized examples.
 
-Domain primitives are shared with `cctp-rs` where they belong. The CLI uses
-`CctpV2Route` for route validation and `UsdcAmount` for six-decimal USDC amount
-parsing. Wallet backends, RPC endpoints, dry-run behavior, and relay policy stay
-in the CLI because they are application concerns.
+Domain primitives are shared with `cctp-rs` where they belong. The CLI route
+catalog decides which `CctpV2Route` values this application supports, and
+`UsdcAmount` handles six-decimal USDC amount parsing. Adding another supported
+route should be localized to the catalog, config tests, and this documentation.
+Wallet backends, RPC endpoints, dry-run behavior, and relay policy stay in the
+CLI because they are application concerns.
