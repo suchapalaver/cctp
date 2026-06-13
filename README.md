@@ -72,7 +72,22 @@ before resolving configuration. Keep real RPC URLs in local `.env`;
 git.
 
 By default this sends standard-finality CCTP v2 transactions. To request fast
-finality, provide an explicit fee cap:
+finality, pass `--fast`:
+
+```sh
+cctp bridge \
+  --amount 10.25 \
+  --fast
+```
+
+For fast transfers, the CLI fetches the live route fee from CCTP before any
+signing prompt, prints the fee and cap in the bridge intent, and fails closed if
+the fee cannot be resolved. When `--max-fee-usdc` is omitted, the CLI uses the
+live fee plus a 20% buffer as the transaction `maxFee`.
+
+To provide a manual cap, pass `--max-fee-usdc`. The CLI still fetches the live
+fee first and rejects the run if the manual cap is below the current required
+fee:
 
 ```sh
 cctp bridge \
@@ -92,10 +107,11 @@ independently with `--relay-trezor-account`.
 Before any signing prompt, the CLI verifies both RPC providers report the
 expected chain IDs, resolves the CCTP contracts, and prints a bridge intent with
 the active Trezor account roles, derivation paths, chain bindings, addresses,
-amount, fee cap, approval spender, destination MessageTransmitter, and relay
-policy. A live run requires typing `CONFIRM` after reviewing that intent. Use
-`--dry-run` to render the same intent without sending transactions, or `--yes`
-for explicit non-interactive automation.
+amount, resolved fast-transfer fee and cap when applicable, approval spender,
+destination MessageTransmitter, and relay policy. A live run requires typing
+`CONFIRM` after reviewing that intent. Use `--dry-run` to render the same intent
+without sending transactions, or `--yes` for explicit non-interactive
+automation.
 
 ## Configuration
 

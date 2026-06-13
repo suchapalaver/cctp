@@ -13,8 +13,8 @@ use alloy::{
 use alloy_chains::NamedChain;
 use async_trait::async_trait;
 use cctp_rs::{
-    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, MintResult, PollingConfig, TransferMode,
-    UsdcAmount,
+    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, MintResult, PollingConfig, TransferFee,
+    TransferMode, UsdcAmount,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
@@ -27,6 +27,7 @@ const MAINNET_USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
 const DEFAULT_LOG_FILTER: &str = "info,cctp_rs=info";
 const ETHEREUM_RPC_ENV: &str = "ETHEREUM_RPC_URL";
 const HYPEREVM_RPC_ENV: &str = "HYPEREVM_RPC_URL";
+const DEFAULT_FAST_FEE_BUFFER_PERCENT: u32 = 20;
 
 #[derive(Debug, Parser)]
 #[command(name = "cctp")]
@@ -100,7 +101,9 @@ struct BridgeArgs {
     )]
     fast: Option<bool>,
 
-    /// Fast-transfer fee cap in USDC decimal units. Required with --fast.
+    /// Optional fast-transfer fee cap in USDC decimal units.
+    ///
+    /// When omitted, the CLI resolves the live route fee and adds a buffer.
     #[arg(long)]
     max_fee_usdc: Option<String>,
 
@@ -213,6 +216,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let wallet_service = TrezorWalletService;
     let provider_service = AlloyProviderService;
     let provider_validation_service = AlloyProviderValidationService;
+    let fee_resolution_service = CctpFeeResolutionService;
     let approval_service = TerminalIntentApprovalService;
     let reporter = HumanReporter;
 
@@ -230,7 +234,18 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let recipient = config.recipient.resolve(source_signer_address);
 
     let providers = provider_service.bridge_providers(&config, source_signer.signer, relay_signer);
-    let bridge = provider_service.bridge(&config, &providers, recipient);
+    let fee_bridge =
+        provider_service.bridge(&config, &providers, recipient, TransferMode::Standard);
+    let resolved_transfer = fee_resolution_service
+        .resolve(&fee_bridge, &config)
+        .await
+        .wrap_err("failed to resolve transfer fee policy")?;
+    let bridge = provider_service.bridge(
+        &config,
+        &providers,
+        recipient,
+        resolved_transfer.mode.clone(),
+    );
     let contracts = BridgeContracts::from_bridge(&bridge)?;
     let intent = BridgeIntent::new(
         &config,
@@ -239,6 +254,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
         relay_account,
         provider_validation,
         contracts,
+        resolved_transfer.clone(),
     );
     reporter.report_intent(&intent);
 
@@ -252,7 +268,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
 
     let runtime = CctpBridgeRuntime::new(bridge, providers.source, providers.destination);
     let mut workflow = BridgeWorkflow::new(
-        BridgeWorkflowConfig::from(&config),
+        BridgeWorkflowConfig::new(&config, resolved_transfer.mode),
         runtime,
         source_signer_address,
         recipient,
@@ -366,7 +382,7 @@ where
             relay_wallet,
             recipient: RecipientConfig::from(args.recipient.or(file.recipient)),
             usdc: args.usdc.or(file.usdc).unwrap_or(MAINNET_USDC),
-            transfer_mode: transfer_mode(fast, max_fee_usdc.as_deref())?,
+            transfer: transfer_request(fast, max_fee_usdc.as_deref())?,
             relay: RelayMode::from_self_relay(self_relay),
             receive_polling,
             dry_run,
@@ -418,7 +434,7 @@ struct BridgeConfig {
     relay_wallet: RelayWalletConfig,
     recipient: RecipientConfig,
     usdc: Address,
-    transfer_mode: TransferMode,
+    transfer: TransferRequest,
     relay: RelayMode,
     receive_polling: ReceivePolling,
     dry_run: bool,
@@ -435,23 +451,21 @@ struct BridgeWorkflowConfig {
 }
 
 impl BridgeWorkflowConfig {
+    const fn new(config: &BridgeConfig, transfer_mode: TransferMode) -> Self {
+        Self {
+            amount: config.amount,
+            usdc: config.usdc,
+            transfer_mode,
+            relay: config.relay,
+            receive_polling: config.receive_polling,
+        }
+    }
+
     fn attestation_polling_config(&self) -> PollingConfig {
         if self.transfer_mode.is_fast() {
             PollingConfig::fast_transfer()
         } else {
             PollingConfig::default()
-        }
-    }
-}
-
-impl From<&BridgeConfig> for BridgeWorkflowConfig {
-    fn from(config: &BridgeConfig) -> Self {
-        Self {
-            amount: config.amount,
-            usdc: config.usdc,
-            transfer_mode: config.transfer_mode.clone(),
-            relay: config.relay,
-            receive_polling: config.receive_polling,
         }
     }
 }
@@ -801,12 +815,8 @@ impl RouteConfig {
         u64::from(self.route.destination_chain())
     }
 
-    const fn source_chain(&self) -> NamedChain {
-        self.route.source_chain()
-    }
-
-    const fn destination_chain(&self) -> NamedChain {
-        self.route.destination_chain()
+    const fn cctp_route(&self) -> CctpV2Route {
+        self.route
     }
 
     const fn source_label(&self) -> &'static str {
@@ -978,23 +988,143 @@ impl ReceivePolling {
     }
 }
 
-fn transfer_mode(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferMode> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferRequest {
+    Standard,
+    Fast { manual_max_fee: Option<UsdcAmount> },
+}
+
+fn transfer_request(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferRequest> {
     if !fast {
         if max_fee_usdc.is_some() {
             bail!("--max-fee-usdc is only valid with --fast");
         }
-        return Ok(TransferMode::Standard);
+        return Ok(TransferRequest::Standard);
     }
 
-    let max_fee = max_fee_usdc.ok_or_else(|| eyre!("--fast requires --max-fee-usdc"))?;
+    let manual_max_fee = max_fee_usdc
+        .map(UsdcAmount::parse_decimal)
+        .transpose()
+        .wrap_err("failed to parse --max-fee-usdc")?;
 
-    Ok(TransferMode::Fast {
-        max_fee: UsdcAmount::parse_decimal(max_fee)?.atomic(),
-    })
+    Ok(TransferRequest::Fast { manual_max_fee })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedTransferMode {
+    mode: TransferMode,
+    fee: TransferFeeResolution,
+}
+
+impl ResolvedTransferMode {
+    const fn standard() -> Self {
+        Self {
+            mode: TransferMode::Standard,
+            fee: TransferFeeResolution::Standard,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferFeeResolution {
+    Standard,
+    Fast(FastTransferFeeResolution),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FastTransferFeeResolution {
+    live_fee: TransferFee,
+    live_fee_amount: U256,
+    max_fee: U256,
+    cap_source: FastFeeCapSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastFeeCapSource {
+    LiveBuffered { buffer_percent: u32 },
+    Manual,
 }
 
 fn mode_label(mode: &TransferMode) -> &'static str {
     if mode.is_fast() { "fast" } else { "standard" }
+}
+
+fn resolve_fast_transfer_fee(
+    amount: UsdcAmount,
+    live_fee: TransferFee,
+    manual_max_fee: Option<UsdcAmount>,
+) -> Result<FastTransferFeeResolution> {
+    let live_fee_amount = live_fee.max_fee_with_buffer_percent(amount.atomic(), 0);
+
+    let (max_fee, cap_source) = match manual_max_fee {
+        Some(manual_max_fee) => {
+            let manual_max_fee = manual_max_fee.atomic();
+            if manual_max_fee < live_fee_amount {
+                bail!(
+                    "manual fast-transfer fee cap {} USDC is below the current live fast-transfer fee {} USDC",
+                    UsdcAmount::from_atomic(manual_max_fee),
+                    UsdcAmount::from_atomic(live_fee_amount)
+                );
+            }
+            (manual_max_fee, FastFeeCapSource::Manual)
+        }
+        None => (
+            live_fee.max_fee_with_buffer_percent(amount.atomic(), DEFAULT_FAST_FEE_BUFFER_PERCENT),
+            FastFeeCapSource::LiveBuffered {
+                buffer_percent: DEFAULT_FAST_FEE_BUFFER_PERCENT,
+            },
+        ),
+    };
+
+    Ok(FastTransferFeeResolution {
+        live_fee,
+        live_fee_amount,
+        max_fee,
+        cap_source,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CctpFeeResolutionService;
+
+impl CctpFeeResolutionService {
+    async fn resolve<P>(
+        self,
+        bridge: &CctpV2Bridge<P>,
+        config: &BridgeConfig,
+    ) -> Result<ResolvedTransferMode>
+    where
+        P: Provider + Clone,
+    {
+        match config.transfer {
+            TransferRequest::Standard => Ok(ResolvedTransferMode::standard()),
+            TransferRequest::Fast { manual_max_fee } => {
+                let live_fee = bridge
+                    .get_fast_transfer_fee()
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to fetch live fast-transfer fee for route {}",
+                            config.route
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        eyre!(
+                            "live fast-transfer fee is unavailable for route {}; refusing to sign without fee data",
+                            config.route
+                        )
+                    })?;
+                let fee = resolve_fast_transfer_fee(config.amount, live_fee, manual_max_fee)?;
+
+                Ok(ResolvedTransferMode {
+                    mode: TransferMode::Fast {
+                        max_fee: fee.max_fee,
+                    },
+                    fee: TransferFeeResolution::Fast(fee),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1270,14 +1400,13 @@ impl AlloyProviderService {
         config: &BridgeConfig,
         providers: &BridgeProviders,
         recipient: Address,
+        transfer_mode: TransferMode,
     ) -> CctpV2Bridge<DynProvider> {
-        CctpV2Bridge::builder()
-            .source_chain(config.route.source_chain())
-            .destination_chain(config.route.destination_chain())
+        CctpV2Bridge::from_route(config.route.cctp_route())
             .source_provider(providers.source.clone())
             .destination_provider(providers.destination.clone())
             .recipient(recipient)
-            .transfer_mode(config.transfer_mode.clone())
+            .transfer_mode(transfer_mode)
             .build()
     }
 }
@@ -1428,7 +1557,7 @@ struct BridgeIntent {
     recipient: Address,
     usdc: Address,
     amount: UsdcAmount,
-    transfer_mode: TransferMode,
+    transfer: ResolvedTransferMode,
     relay: RelayMode,
     relay_account: Option<WalletAccount>,
     provider_validation: ProviderValidation,
@@ -1443,6 +1572,7 @@ impl BridgeIntent {
         relay_account: Option<WalletAccount>,
         provider_validation: ProviderValidation,
         contracts: BridgeContracts,
+        transfer: ResolvedTransferMode,
     ) -> Self {
         Self {
             route: config.route,
@@ -1450,7 +1580,7 @@ impl BridgeIntent {
             recipient,
             usdc: config.usdc,
             amount: config.amount,
-            transfer_mode: config.transfer_mode.clone(),
+            transfer,
             relay: config.relay,
             relay_account,
             provider_validation,
@@ -1472,7 +1602,7 @@ impl HumanReporter {
         println!("Recipient: {}", intent.recipient);
         println!("USDC: {}", intent.usdc);
         println!("Amount: {} USDC", intent.amount);
-        self.report_transfer_mode(&intent.transfer_mode);
+        self.report_transfer_mode(&intent.transfer);
         println!("Relay: {}", intent.relay);
         match intent.relay_account {
             Some(account) => self.report_wallet_account("Relay", &account),
@@ -1512,13 +1642,28 @@ impl HumanReporter {
         println!("{label} address: {}", account.address);
     }
 
-    fn report_transfer_mode(self, mode: &TransferMode) {
-        println!("Mode: {}", mode_label(mode));
-        if mode.is_fast() {
+    fn report_transfer_mode(self, transfer: &ResolvedTransferMode) {
+        println!("Mode: {}", mode_label(&transfer.mode));
+        if let TransferFeeResolution::Fast(fee) = transfer.fee {
             println!(
-                "Fast fee cap: {} USDC",
-                UsdcAmount::from_atomic(mode.max_fee())
+                "Fast live fee: {} bps ({} USDC for this amount)",
+                fee.live_fee.minimum_fee,
+                UsdcAmount::from_atomic(fee.live_fee_amount)
             );
+            match fee.cap_source {
+                FastFeeCapSource::LiveBuffered { buffer_percent } => {
+                    println!(
+                        "Fast fee cap: {} USDC (live fee + {buffer_percent}% buffer)",
+                        UsdcAmount::from_atomic(fee.max_fee)
+                    );
+                }
+                FastFeeCapSource::Manual => {
+                    println!(
+                        "Fast fee cap: {} USDC (manual cap)",
+                        UsdcAmount::from_atomic(fee.max_fee)
+                    );
+                }
+            }
         }
     }
 
@@ -1592,6 +1737,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cctp_rs::FeeBps;
     use std::{
         collections::HashMap,
         sync::atomic::{AtomicU64, Ordering},
@@ -1670,8 +1816,14 @@ mod tests {
             .bridge_config(sample_args())
             .expect("valid config");
 
-        assert_eq!(config.route.source_chain(), NamedChain::Mainnet);
-        assert_eq!(config.route.destination_chain(), NamedChain::Hyperliquid);
+        assert_eq!(
+            config.route.cctp_route().source_chain(),
+            NamedChain::Mainnet
+        );
+        assert_eq!(
+            config.route.cctp_route().destination_chain(),
+            NamedChain::Hyperliquid
+        );
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
@@ -1679,7 +1831,7 @@ mod tests {
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
-        assert!(matches!(config.transfer_mode, TransferMode::Standard));
+        assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.confirmation, ConfirmationPolicy::RequireInteractive);
     }
 
@@ -1692,25 +1844,101 @@ mod tests {
     }
 
     #[test]
-    fn config_service_requires_fast_fee_for_fast_mode() {
+    fn config_service_accepts_fast_without_manual_fee() {
         let mut args = sample_args();
         args.fast = Some(true);
 
-        assert!(empty_service().bridge_config(args).is_err());
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(
+            config.transfer,
+            TransferRequest::Fast {
+                manual_max_fee: None
+            }
+        );
     }
 
     #[test]
-    fn config_service_parses_fast_fee() {
+    fn config_service_parses_manual_fast_fee_cap() {
         let mut args = sample_args();
         args.fast = Some(true);
         args.max_fee_usdc = Some("0.01".to_owned());
 
         let config = empty_service().bridge_config(args).expect("valid config");
         assert_eq!(
-            config.transfer_mode,
-            TransferMode::Fast {
-                max_fee: U256::from(10_000u64)
+            config.transfer,
+            TransferRequest::Fast {
+                manual_max_fee: Some(UsdcAmount::from_atomic(U256::from(10_000u64)))
             }
+        );
+    }
+
+    #[test]
+    fn config_service_rejects_manual_fee_cap_without_fast_mode() {
+        let mut args = sample_args();
+        args.max_fee_usdc = Some("0.01".to_owned());
+
+        let error = empty_service()
+            .bridge_config(args)
+            .expect_err("fee cap without fast mode is invalid");
+
+        assert!(
+            error.to_string().contains("only valid with --fast"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fast_fee_resolution_uses_buffered_live_fee_without_manual_cap() {
+        let amount = UsdcAmount::from_atomic(U256::from(1_000_000u64));
+        let live_fee = TransferFee::new(1000, FeeBps::from_hundredths(100));
+
+        let resolved =
+            resolve_fast_transfer_fee(amount, live_fee, None).expect("fee resolution succeeds");
+
+        assert_eq!(resolved.live_fee, live_fee);
+        assert_eq!(resolved.live_fee_amount, U256::from(100u64));
+        assert_eq!(resolved.max_fee, U256::from(120u64));
+        assert_eq!(
+            resolved.cap_source,
+            FastFeeCapSource::LiveBuffered {
+                buffer_percent: DEFAULT_FAST_FEE_BUFFER_PERCENT
+            }
+        );
+    }
+
+    #[test]
+    fn fast_fee_resolution_uses_valid_manual_cap() {
+        let amount = UsdcAmount::from_atomic(U256::from(1_000_000u64));
+        let live_fee = TransferFee::new(1000, FeeBps::from_hundredths(100));
+
+        let resolved = resolve_fast_transfer_fee(
+            amount,
+            live_fee,
+            Some(UsdcAmount::from_atomic(U256::from(150u64))),
+        )
+        .expect("fee resolution succeeds");
+
+        assert_eq!(resolved.live_fee_amount, U256::from(100u64));
+        assert_eq!(resolved.max_fee, U256::from(150u64));
+        assert_eq!(resolved.cap_source, FastFeeCapSource::Manual);
+    }
+
+    #[test]
+    fn fast_fee_resolution_rejects_manual_cap_below_live_fee() {
+        let amount = UsdcAmount::from_atomic(U256::from(1_000_000u64));
+        let live_fee = TransferFee::new(1000, FeeBps::from_hundredths(100));
+
+        let error = resolve_fast_transfer_fee(
+            amount,
+            live_fee,
+            Some(UsdcAmount::from_atomic(U256::from(99u64))),
+        )
+        .expect_err("below-fee cap is invalid");
+
+        assert!(
+            error.to_string().contains("below the current live"),
+            "unexpected error: {error}"
         );
     }
 
@@ -1804,8 +2032,14 @@ receive_interval_secs = 7
 
         let config = empty_service().bridge_config(args).expect("valid config");
 
-        assert_eq!(config.route.source_chain(), NamedChain::Mainnet);
-        assert_eq!(config.route.destination_chain(), NamedChain::Hyperliquid);
+        assert_eq!(
+            config.route.cctp_route().source_chain(),
+            NamedChain::Mainnet
+        );
+        assert_eq!(
+            config.route.cctp_route().destination_chain(),
+            NamedChain::Hyperliquid
+        );
         assert_eq!(config.amount.atomic(), U256::from(2_500_000u64));
         assert_eq!(
             config.recipient,
@@ -1889,7 +2123,7 @@ dry_run = true
 
         let config = empty_service().bridge_config(args).expect("valid config");
 
-        assert_eq!(config.transfer_mode, TransferMode::Standard);
+        assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert!(!config.dry_run);
@@ -2067,6 +2301,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some(relay_account),
             provider_validation,
             contracts,
+            ResolvedTransferMode::standard(),
         );
 
         assert_eq!(intent.route, config.route);
@@ -2080,6 +2315,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         assert_eq!(intent.relay_account, Some(relay_account));
         assert_eq!(intent.provider_validation, provider_validation);
         assert_eq!(intent.contracts, contracts);
+        assert_eq!(intent.transfer, ResolvedTransferMode::standard());
     }
 
     #[test]
