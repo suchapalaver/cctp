@@ -48,7 +48,9 @@ before pushing a release tag:
 
 To verify the workflow without publishing, run the Release workflow manually from
 GitHub Actions. The manual path runs tests, clippy, package listing, and
-`cargo publish --dry-run`; it skips the final publish step.
+`cargo publish --dry-run`; it skips crates.io OIDC authentication and the final
+publish step. The tag path is the only workflow path that exchanges GitHub's
+OIDC token for a short-lived crates.io token.
 
 To publish, bump `Cargo.toml`, commit the release, then push a `v*` tag. The tag
 workflow exchanges GitHub's OIDC token for a short-lived crates.io token and runs
