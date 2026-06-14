@@ -213,70 +213,141 @@ fn load_dotenv() -> Result<()> {
 
 async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let config = CliConfigService::default().bridge_config(args)?;
-    let wallet_service = TrezorWalletService;
-    let provider_service = AlloyProviderService;
-    let provider_validation_service = AlloyProviderValidationService;
-    let fee_resolution_service = CctpFeeResolutionService;
-    let approval_service = TerminalIntentApprovalService;
-    let reporter = HumanReporter;
+    BridgeApp::production().run(config).await.map(|_| ())
+}
 
-    let validation_providers = provider_service.read_only_providers(&config);
-    let provider_validation = provider_validation_service
-        .validate(&config, &validation_providers)
-        .await?;
+#[derive(Clone, Debug)]
+struct BridgeApp<W, P, V, F, A, R> {
+    wallet_service: W,
+    provider_service: P,
+    provider_validation_service: V,
+    fee_resolution_service: F,
+    approval_service: A,
+    reporter: R,
+}
 
-    let source_signer = wallet_service.source_signer(&config).await?;
-    let relay_signer = wallet_service.relay_signer(&config).await?;
-    let source_account = source_signer.account;
-    let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
-    let source_signer_address = source_account.address;
-    let relay_signer_address = relay_account.map(|account| account.address);
-    let recipient = config.recipient.resolve(source_signer_address);
+type ProductionBridgeApp = BridgeApp<
+    TrezorWalletService,
+    AlloyProviderService,
+    AlloyProviderValidationService,
+    CctpFeeResolutionService,
+    TerminalIntentApprovalService,
+    HumanReporter,
+>;
 
-    let providers = provider_service.bridge_providers(&config, source_signer.signer, relay_signer);
-    let fee_bridge =
-        provider_service.bridge(&config, &providers, recipient, TransferMode::Standard);
-    let resolved_transfer = fee_resolution_service
-        .resolve(&fee_bridge, &config)
-        .await
-        .wrap_err("failed to resolve transfer fee policy")?;
-    let bridge = provider_service.bridge(
-        &config,
-        &providers,
-        recipient,
-        resolved_transfer.mode.clone(),
-    );
-    let contracts = BridgeContracts::from_bridge(&bridge)?;
-    let intent = BridgeIntent::new(
-        &config,
-        source_account,
-        recipient,
-        relay_account,
-        provider_validation,
-        contracts,
-        resolved_transfer.clone(),
-    );
-    reporter.report_intent(&intent);
-
-    if config.dry_run {
-        reporter.report_dry_run_complete();
-        return Ok(());
+impl ProductionBridgeApp {
+    const fn production() -> Self {
+        Self::new(
+            TrezorWalletService,
+            AlloyProviderService,
+            AlloyProviderValidationService,
+            CctpFeeResolutionService,
+            TerminalIntentApprovalService,
+            HumanReporter,
+        )
     }
+}
 
-    approval_service.confirm(&intent, config.confirmation)?;
-    reporter.report_workflow_start();
+impl<W, P, V, F, A, R> BridgeApp<W, P, V, F, A, R> {
+    const fn new(
+        wallet_service: W,
+        provider_service: P,
+        provider_validation_service: V,
+        fee_resolution_service: F,
+        approval_service: A,
+        reporter: R,
+    ) -> Self {
+        Self {
+            wallet_service,
+            provider_service,
+            provider_validation_service,
+            fee_resolution_service,
+            approval_service,
+            reporter,
+        }
+    }
+}
 
-    let runtime = CctpBridgeRuntime::new(bridge, providers.source, providers.destination);
-    let mut workflow = BridgeWorkflow::new(
-        BridgeWorkflowConfig::new(&config, resolved_transfer.mode),
-        runtime,
-        source_signer_address,
-        recipient,
-        relay_signer_address,
-    );
-    let outcome = workflow.run().await?;
-    reporter.report_outcome(&outcome);
-    Ok(())
+impl<W, P, V, F, A, R> BridgeApp<W, P, V, F, A, R>
+where
+    W: WalletService,
+    P: ProviderService<W>,
+    V: ProviderValidationService<P::Providers>,
+    F: FeeResolutionService<P::Bridge>,
+    A: IntentApprovalService,
+    R: Reporter,
+{
+    async fn run(&self, config: BridgeConfig) -> Result<BridgeRunResult> {
+        let validation_providers = self.provider_service.read_only_providers(&config);
+        let provider_validation = self
+            .provider_validation_service
+            .validate(&config, &validation_providers)
+            .await?;
+
+        let source_signer = self.wallet_service.source_signer(&config).await?;
+        let relay_signer = self.wallet_service.relay_signer(&config).await?;
+        let source_account = source_signer.account;
+        let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
+        let source_signer_address = source_account.address;
+        let relay_signer_address = relay_account.map(|account| account.address);
+        let recipient = config.recipient.resolve(source_signer_address);
+
+        let providers =
+            self.provider_service
+                .bridge_providers(&config, source_signer.signer, relay_signer);
+        let fee_bridge =
+            self.provider_service
+                .bridge(&config, &providers, recipient, TransferMode::Standard);
+        let resolved_transfer = self
+            .fee_resolution_service
+            .resolve(&fee_bridge, &config)
+            .await
+            .wrap_err("failed to resolve transfer fee policy")?;
+        let bridge = self.provider_service.bridge(
+            &config,
+            &providers,
+            recipient,
+            resolved_transfer.mode.clone(),
+        );
+        let contracts = self.provider_service.contracts(&bridge)?;
+        let intent = BridgeIntent::new(
+            &config,
+            source_account,
+            recipient,
+            relay_account,
+            provider_validation,
+            contracts,
+            resolved_transfer.clone(),
+        );
+        self.reporter.report_intent(&intent);
+
+        if config.dry_run {
+            self.reporter.report_dry_run_complete();
+            return Ok(BridgeRunResult::DryRun);
+        }
+
+        self.approval_service
+            .confirm(&intent, config.confirmation)?;
+        self.reporter.report_workflow_start();
+
+        let runtime = self.provider_service.runtime(bridge, providers);
+        let mut workflow = BridgeWorkflow::new(
+            BridgeWorkflowConfig::new(&config, resolved_transfer.mode),
+            runtime,
+            source_signer_address,
+            recipient,
+            relay_signer_address,
+        );
+        let outcome = workflow.run().await?;
+        self.reporter.report_outcome(&outcome);
+        Ok(BridgeRunResult::Executed(outcome))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BridgeRunResult {
+    DryRun,
+    Executed(BridgeOutcome),
 }
 
 trait ConfigService {
@@ -1573,15 +1644,21 @@ fn resolve_fast_transfer_fee(
 #[derive(Clone, Copy, Debug, Default)]
 struct CctpFeeResolutionService;
 
-impl CctpFeeResolutionService {
-    async fn resolve<P>(
-        self,
+#[async_trait(?Send)]
+trait FeeResolutionService<B> {
+    async fn resolve(&self, bridge: &B, config: &BridgeConfig) -> Result<ResolvedTransferMode>;
+}
+
+#[async_trait(?Send)]
+impl<P> FeeResolutionService<CctpV2Bridge<P>> for CctpFeeResolutionService
+where
+    P: Provider + Clone,
+{
+    async fn resolve(
+        &self,
         bridge: &CctpV2Bridge<P>,
         config: &BridgeConfig,
-    ) -> Result<ResolvedTransferMode>
-    where
-        P: Provider + Clone,
-    {
+    ) -> Result<ResolvedTransferMode> {
         match config.transfer {
             TransferRequest::Standard => Ok(ResolvedTransferMode::standard()),
             TransferRequest::Fast { manual_max_fee } => {
@@ -1768,13 +1845,13 @@ impl RelayWalletConfig {
     }
 }
 
-struct RelaySignerRuntime {
-    signer: TrezorSigner,
+struct RelaySignerRuntime<S> {
+    signer: S,
     account: WalletAccount,
 }
 
-struct SourceSignerRuntime {
-    signer: TrezorSigner,
+struct SourceSignerRuntime<S> {
+    signer: S,
     account: WalletAccount,
 }
 
@@ -1783,14 +1860,29 @@ struct TrezorWalletService;
 
 #[async_trait(?Send)]
 trait WalletService {
-    async fn source_signer(&self, config: &BridgeConfig) -> Result<SourceSignerRuntime>;
+    type SourceSigner;
+    type RelaySigner;
 
-    async fn relay_signer(&self, config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>>;
+    async fn source_signer(
+        &self,
+        config: &BridgeConfig,
+    ) -> Result<SourceSignerRuntime<Self::SourceSigner>>;
+
+    async fn relay_signer(
+        &self,
+        config: &BridgeConfig,
+    ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>>;
 }
 
 #[async_trait(?Send)]
 impl WalletService for TrezorWalletService {
-    async fn source_signer(&self, config: &BridgeConfig) -> Result<SourceSignerRuntime> {
+    type SourceSigner = TrezorSigner;
+    type RelaySigner = TrezorSigner;
+
+    async fn source_signer(
+        &self,
+        config: &BridgeConfig,
+    ) -> Result<SourceSignerRuntime<TrezorSigner>> {
         let signer = config
             .source_wallet
             .trezor_signer(config.route.source_chain_id())
@@ -1817,7 +1909,10 @@ impl WalletService for TrezorWalletService {
         Ok(SourceSignerRuntime { signer, account })
     }
 
-    async fn relay_signer(&self, config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>> {
+    async fn relay_signer(
+        &self,
+        config: &BridgeConfig,
+    ) -> Result<Option<RelaySignerRuntime<TrezorSigner>>> {
         let Some(wallet) = config.relay_wallet.wallet() else {
             return Ok(None);
         };
@@ -1857,8 +1952,42 @@ struct BridgeProviders {
 #[derive(Clone, Copy, Debug, Default)]
 struct AlloyProviderService;
 
-impl AlloyProviderService {
-    fn read_only_providers(self, config: &BridgeConfig) -> BridgeProviders {
+trait ProviderService<W>
+where
+    W: WalletService,
+{
+    type Providers;
+    type Bridge;
+    type Runtime: BridgeRuntime;
+
+    fn read_only_providers(&self, config: &BridgeConfig) -> Self::Providers;
+
+    fn bridge_providers(
+        &self,
+        config: &BridgeConfig,
+        source_signer: W::SourceSigner,
+        relay_signer: Option<RelaySignerRuntime<W::RelaySigner>>,
+    ) -> Self::Providers;
+
+    fn bridge(
+        &self,
+        config: &BridgeConfig,
+        providers: &Self::Providers,
+        recipient: Address,
+        transfer_mode: TransferMode,
+    ) -> Self::Bridge;
+
+    fn contracts(&self, bridge: &Self::Bridge) -> Result<BridgeContracts>;
+
+    fn runtime(&self, bridge: Self::Bridge, providers: Self::Providers) -> Self::Runtime;
+}
+
+impl ProviderService<TrezorWalletService> for AlloyProviderService {
+    type Providers = BridgeProviders;
+    type Bridge = CctpV2Bridge<DynProvider>;
+    type Runtime = CctpBridgeRuntime<DynProvider>;
+
+    fn read_only_providers(&self, config: &BridgeConfig) -> BridgeProviders {
         BridgeProviders {
             source: ProviderBuilder::new()
                 .connect_http(config.rpc.source.clone())
@@ -1870,10 +1999,10 @@ impl AlloyProviderService {
     }
 
     fn bridge_providers(
-        self,
+        &self,
         config: &BridgeConfig,
         source_signer: TrezorSigner,
-        relay_signer: Option<RelaySignerRuntime>,
+        relay_signer: Option<RelaySignerRuntime<TrezorSigner>>,
     ) -> BridgeProviders {
         let source = ProviderBuilder::new()
             .wallet(source_signer)
@@ -1896,7 +2025,7 @@ impl AlloyProviderService {
     }
 
     fn bridge(
-        self,
+        &self,
         config: &BridgeConfig,
         providers: &BridgeProviders,
         recipient: Address,
@@ -1909,22 +2038,30 @@ impl AlloyProviderService {
             .transfer_mode(transfer_mode)
             .build()
     }
+
+    fn contracts(&self, bridge: &CctpV2Bridge<DynProvider>) -> Result<BridgeContracts> {
+        BridgeContracts::from_bridge(bridge)
+    }
+
+    fn runtime(
+        &self,
+        bridge: CctpV2Bridge<DynProvider>,
+        providers: BridgeProviders,
+    ) -> CctpBridgeRuntime<DynProvider> {
+        CctpBridgeRuntime::new(bridge, providers.source, providers.destination)
+    }
 }
 
 #[async_trait(?Send)]
-trait ProviderValidationService {
-    async fn validate(
-        &self,
-        config: &BridgeConfig,
-        providers: &BridgeProviders,
-    ) -> Result<ProviderValidation>;
+trait ProviderValidationService<P> {
+    async fn validate(&self, config: &BridgeConfig, providers: &P) -> Result<ProviderValidation>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AlloyProviderValidationService;
 
 #[async_trait(?Send)]
-impl ProviderValidationService for AlloyProviderValidationService {
+impl ProviderValidationService<BridgeProviders> for AlloyProviderValidationService {
     async fn validate(
         &self,
         config: &BridgeConfig,
@@ -2094,8 +2231,36 @@ impl BridgeIntent {
 #[derive(Clone, Copy, Debug, Default)]
 struct HumanReporter;
 
+trait Reporter {
+    fn report_intent(&self, intent: &BridgeIntent);
+
+    fn report_dry_run_complete(&self);
+
+    fn report_workflow_start(&self);
+
+    fn report_outcome(&self, outcome: &BridgeOutcome);
+}
+
+impl Reporter for HumanReporter {
+    fn report_intent(&self, intent: &BridgeIntent) {
+        HumanReporter::report_intent(self, intent);
+    }
+
+    fn report_dry_run_complete(&self) {
+        HumanReporter::report_dry_run_complete(self);
+    }
+
+    fn report_workflow_start(&self) {
+        HumanReporter::report_workflow_start(self);
+    }
+
+    fn report_outcome(&self, outcome: &BridgeOutcome) {
+        HumanReporter::report_outcome(self, outcome);
+    }
+}
+
 impl HumanReporter {
-    fn report_intent(self, intent: &BridgeIntent) {
+    fn report_intent(&self, intent: &BridgeIntent) {
         println!("Bridge intent");
         println!("Route: {} ({})", intent.route, intent.provenance.route);
         self.report_provider_check(
@@ -2144,7 +2309,7 @@ impl HumanReporter {
         );
     }
 
-    fn report_provider_check(self, check: &ProviderChainCheck, endpoint: &RpcEndpointProvenance) {
+    fn report_provider_check(&self, check: &ProviderChainCheck, endpoint: &RpcEndpointProvenance) {
         println!(
             "{} verified: {} (chain id {}, endpoint {}, {})",
             check.role.report_label(),
@@ -2155,7 +2320,7 @@ impl HumanReporter {
         );
     }
 
-    fn report_wallet_account(self, label: &str, account: &WalletAccount) {
+    fn report_wallet_account(&self, label: &str, account: &WalletAccount) {
         println!("{label} role: {}", account.role);
         println!("{label} wallet: {}", account.wallet);
         println!("{label} derivation: {}", account.derivation_path);
@@ -2166,7 +2331,11 @@ impl HumanReporter {
         println!("{label} address: {}", account.address);
     }
 
-    fn report_transfer_mode(self, transfer: &ResolvedTransferMode, fast_source: ConfigValueSource) {
+    fn report_transfer_mode(
+        &self,
+        transfer: &ResolvedTransferMode,
+        fast_source: ConfigValueSource,
+    ) {
         println!(
             "Mode: {} (fast mode {})",
             mode_label(&transfer.mode),
@@ -2195,15 +2364,15 @@ impl HumanReporter {
         }
     }
 
-    fn report_dry_run_complete(self) {
+    fn report_dry_run_complete(&self) {
         println!("Dry run complete. No transactions sent.");
     }
 
-    fn report_workflow_start(self) {
+    fn report_workflow_start(&self) {
         println!("Starting bridge workflow.");
     }
 
-    fn report_outcome(self, outcome: &BridgeOutcome) {
+    fn report_outcome(&self, outcome: &BridgeOutcome) {
         println!("Source sender: {}", outcome.source_sender);
         println!("Recipient: {}", outcome.recipient);
         println!("TokenMessengerV2: {}", outcome.token_messenger);
@@ -2267,7 +2436,9 @@ mod tests {
     use super::*;
     use cctp_rs::FeeBps;
     use std::{
+        cell::RefCell,
         collections::HashMap,
+        rc::Rc,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -3041,6 +3212,321 @@ hyperevm_rpc = "https://file.hyperevm.example"
             error.to_string().contains("not confirmed"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_app_dry_run_reports_intent_without_approval_or_workflow() {
+        let calls = SharedCalls::default();
+        let mut args = sample_args();
+        args.dry_run = Some(true);
+        let config = empty_service().bridge_config(args).expect("valid config");
+        let app = mock_bridge_app(calls.clone());
+
+        let result = app.run(config).await.expect("dry run succeeds");
+
+        assert_eq!(result, BridgeRunResult::DryRun);
+        assert_eq!(
+            calls.entries(),
+            vec![
+                "read_only_providers",
+                "validate_providers",
+                "source_signer",
+                "relay_signer",
+                "bridge_providers",
+                "bridge_standard",
+                "resolve_fee",
+                "bridge_standard",
+                "contracts",
+                "report_intent",
+                "report_dry_run_complete"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_app_executes_successful_workflow_with_injected_services() {
+        let calls = SharedCalls::default();
+        let config = empty_service()
+            .bridge_config(sample_args())
+            .expect("valid config");
+        let app = mock_bridge_app(calls.clone());
+
+        let result = app.run(config).await.expect("bridge succeeds");
+
+        let BridgeRunResult::Executed(outcome) = result else {
+            panic!("expected executed bridge result");
+        };
+        assert_eq!(
+            outcome.approval,
+            ApprovalOutcome::Skipped {
+                allowance: U256::MAX
+            }
+        );
+        assert_eq!(outcome.burn_tx, tx_hash(0x22));
+        assert_eq!(outcome.completion, CompletionOutcome::RelayerCompleted);
+        assert_eq!(
+            calls.entries(),
+            vec![
+                "read_only_providers",
+                "validate_providers",
+                "source_signer",
+                "relay_signer",
+                "bridge_providers",
+                "bridge_standard",
+                "resolve_fee",
+                "bridge_standard",
+                "contracts",
+                "report_intent",
+                "confirm",
+                "report_workflow_start",
+                "runtime",
+                "report_outcome"
+            ]
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct SharedCalls(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Default for SharedCalls {
+        fn default() -> Self {
+            Self(Rc::new(RefCell::new(Vec::new())))
+        }
+    }
+
+    impl SharedCalls {
+        fn push(&self, label: &'static str) {
+            self.0.borrow_mut().push(label);
+        }
+
+        fn entries(&self) -> Vec<&'static str> {
+            self.0.borrow().clone()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct MockSigner;
+
+    #[derive(Clone, Debug)]
+    struct MockWalletService {
+        calls: SharedCalls,
+    }
+
+    #[async_trait(?Send)]
+    impl WalletService for MockWalletService {
+        type SourceSigner = MockSigner;
+        type RelaySigner = MockSigner;
+
+        async fn source_signer(
+            &self,
+            config: &BridgeConfig,
+        ) -> Result<SourceSignerRuntime<Self::SourceSigner>> {
+            self.calls.push("source_signer");
+            Ok(SourceSignerRuntime {
+                signer: MockSigner,
+                account: config.source_wallet.account_info(
+                    WalletRole::SourceBurn,
+                    config.route.source_label(),
+                    config.route.source_chain_id(),
+                    source_sender(),
+                ),
+            })
+        }
+
+        async fn relay_signer(
+            &self,
+            config: &BridgeConfig,
+        ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>> {
+            self.calls.push("relay_signer");
+            let Some(wallet) = config.relay_wallet.wallet() else {
+                return Ok(None);
+            };
+
+            Ok(Some(RelaySignerRuntime {
+                signer: MockSigner,
+                account: wallet.account_info(
+                    WalletRole::DestinationRelay,
+                    config.route.destination_label(),
+                    config.route.destination_chain_id(),
+                    address!("0000000000000000000000000000000000000003"),
+                ),
+            }))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockProviderService {
+        calls: SharedCalls,
+    }
+
+    struct MockProviders;
+
+    struct MockBridge {
+        transfer_mode: TransferMode,
+    }
+
+    impl ProviderService<MockWalletService> for MockProviderService {
+        type Providers = MockProviders;
+        type Bridge = MockBridge;
+        type Runtime = MockBridgeRuntime;
+
+        fn read_only_providers(&self, _config: &BridgeConfig) -> Self::Providers {
+            self.calls.push("read_only_providers");
+            MockProviders
+        }
+
+        fn bridge_providers(
+            &self,
+            _config: &BridgeConfig,
+            _source_signer: MockSigner,
+            _relay_signer: Option<RelaySignerRuntime<MockSigner>>,
+        ) -> Self::Providers {
+            self.calls.push("bridge_providers");
+            MockProviders
+        }
+
+        fn bridge(
+            &self,
+            _config: &BridgeConfig,
+            _providers: &Self::Providers,
+            _recipient: Address,
+            transfer_mode: TransferMode,
+        ) -> Self::Bridge {
+            if transfer_mode.is_fast() {
+                self.calls.push("bridge_fast");
+            } else {
+                self.calls.push("bridge_standard");
+            }
+            MockBridge { transfer_mode }
+        }
+
+        fn contracts(&self, _bridge: &Self::Bridge) -> Result<BridgeContracts> {
+            self.calls.push("contracts");
+            Ok(mock_contracts())
+        }
+
+        fn runtime(&self, _bridge: Self::Bridge, _providers: Self::Providers) -> Self::Runtime {
+            self.calls.push("runtime");
+            MockBridgeRuntime {
+                allowance: U256::MAX,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockProviderValidationService {
+        calls: SharedCalls,
+    }
+
+    #[async_trait(?Send)]
+    impl ProviderValidationService<MockProviders> for MockProviderValidationService {
+        async fn validate(
+            &self,
+            config: &BridgeConfig,
+            _providers: &MockProviders,
+        ) -> Result<ProviderValidation> {
+            self.calls.push("validate_providers");
+            ProviderValidation::new(
+                config.route,
+                config.route.source_chain_id(),
+                config.route.destination_chain_id(),
+            )
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockFeeResolutionService {
+        calls: SharedCalls,
+    }
+
+    #[async_trait(?Send)]
+    impl FeeResolutionService<MockBridge> for MockFeeResolutionService {
+        async fn resolve(
+            &self,
+            bridge: &MockBridge,
+            _config: &BridgeConfig,
+        ) -> Result<ResolvedTransferMode> {
+            self.calls.push("resolve_fee");
+            assert!(
+                !bridge.transfer_mode.is_fast(),
+                "fee resolution bridge should use standard mode"
+            );
+            Ok(ResolvedTransferMode::standard())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockApprovalService {
+        calls: SharedCalls,
+    }
+
+    impl IntentApprovalService for MockApprovalService {
+        fn confirm(&self, _intent: &BridgeIntent, _policy: ConfirmationPolicy) -> Result<()> {
+            self.calls.push("confirm");
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockReporter {
+        calls: SharedCalls,
+    }
+
+    impl Reporter for MockReporter {
+        fn report_intent(&self, _intent: &BridgeIntent) {
+            self.calls.push("report_intent");
+        }
+
+        fn report_dry_run_complete(&self) {
+            self.calls.push("report_dry_run_complete");
+        }
+
+        fn report_workflow_start(&self) {
+            self.calls.push("report_workflow_start");
+        }
+
+        fn report_outcome(&self, _outcome: &BridgeOutcome) {
+            self.calls.push("report_outcome");
+        }
+    }
+
+    fn mock_bridge_app(
+        calls: SharedCalls,
+    ) -> BridgeApp<
+        MockWalletService,
+        MockProviderService,
+        MockProviderValidationService,
+        MockFeeResolutionService,
+        MockApprovalService,
+        MockReporter,
+    > {
+        BridgeApp::new(
+            MockWalletService {
+                calls: calls.clone(),
+            },
+            MockProviderService {
+                calls: calls.clone(),
+            },
+            MockProviderValidationService {
+                calls: calls.clone(),
+            },
+            MockFeeResolutionService {
+                calls: calls.clone(),
+            },
+            MockApprovalService {
+                calls: calls.clone(),
+            },
+            MockReporter { calls },
+        )
+    }
+
+    fn mock_contracts() -> BridgeContracts {
+        BridgeContracts {
+            token_messenger: address!("0000000000000000000000000000000000000010"),
+            message_transmitter: address!("0000000000000000000000000000000000000020"),
+            destination_domain: DomainId::HyperEvm,
+        }
     }
 
     #[tokio::test]
