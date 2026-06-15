@@ -32,6 +32,9 @@ nix develop -c cargo clippy --all-targets --locked -- -D warnings
 nix develop -c cargo test --locked
 ```
 
+Agent and Rust production rules for this CLI are documented in
+[`AGENTS.md`](AGENTS.md) and [`docs/production-rust.md`](docs/production-rust.md).
+
 ## Release
 
 Releases publish to crates.io from `.github/workflows/release.yml` using crates.io
