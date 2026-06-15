@@ -412,31 +412,14 @@ where
         let route = ROUTE_CATALOG.resolve(from.value, to.value)?;
 
         let amount = sourced_required_cli_file(
-            args.amount,
+            args.amount.clone(),
             "--amount",
-            file.amount,
+            file.amount.clone(),
             "amount",
             "missing amount; set --amount or amount in the config file",
         )?;
 
-        let ethereum_rpc = sourced_required_cli_env_file(
-            args.ethereum_rpc,
-            "--ethereum-rpc",
-            self.env.get(ETHEREUM_RPC_ENV),
-            ETHEREUM_RPC_ENV,
-            file.ethereum_rpc,
-            "ethereum_rpc",
-            "missing Ethereum RPC URL; set --ethereum-rpc, ETHEREUM_RPC_URL, or ethereum_rpc in the config file",
-        )?;
-        let hyperevm_rpc = sourced_required_cli_env_file(
-            args.hyperevm_rpc,
-            "--hyperevm-rpc",
-            self.env.get(HYPEREVM_RPC_ENV),
-            HYPEREVM_RPC_ENV,
-            file.hyperevm_rpc,
-            "hyperevm_rpc",
-            "missing HyperEVM RPC URL; set --hyperevm-rpc, HYPEREVM_RPC_URL, or hyperevm_rpc in the config file",
-        )?;
+        let resolved_rpc = CHAIN_ENDPOINT_CATALOG.resolve_route(&route, &args, &file, &self.env)?;
 
         let wallet = sourced_cli_file_default(
             args.wallet,
@@ -501,11 +484,7 @@ where
             trezor_account.value,
         );
         relay_wallet.validate()?;
-        let rpc_sources = ChainRpcEndpointSources {
-            ethereum: ethereum_rpc.source,
-            hyperevm: hyperevm_rpc.source,
-        };
-        let rpc = RpcEndpoints::parse(&route, ethereum_rpc.value, hyperevm_rpc.value)?;
+        let rpc = RpcEndpoints::from_resolved(&resolved_rpc);
         let transfer = transfer_request(
             fast.value,
             max_fee_usdc.as_ref().map(|max_fee| max_fee.value.as_str()),
@@ -518,7 +497,7 @@ where
                 to: to.source,
             },
             amount: amount.source,
-            rpc: RpcEndpointsProvenance::from_rpc(&route, &rpc, rpc_sources),
+            rpc: RpcEndpointsProvenance::from_resolved(&resolved_rpc),
             source_wallet: SourceWalletProvenance {
                 wallet: wallet.source,
                 account: trezor_account.source,
@@ -722,12 +701,15 @@ struct RpcEndpointsProvenance {
 }
 
 impl RpcEndpointsProvenance {
-    fn from_rpc(route: &RouteConfig, rpc: &RpcEndpoints, sources: ChainRpcEndpointSources) -> Self {
+    fn from_resolved(endpoints: &ResolvedChainRpcEndpoints) -> Self {
         Self {
-            source: RpcEndpointProvenance::from_url(sources.for_chain(route.from()), &rpc.source),
+            source: RpcEndpointProvenance::from_url(
+                endpoints.source.config_source,
+                &endpoints.source.url,
+            ),
             destination: RpcEndpointProvenance::from_url(
-                sources.for_chain(route.to()),
-                &rpc.destination,
+                endpoints.destination.config_source,
+                &endpoints.destination.url,
             ),
         }
     }
@@ -1370,51 +1352,132 @@ struct RpcEndpoints {
 }
 
 impl RpcEndpoints {
-    fn parse(route: &RouteConfig, ethereum_rpc: String, hyperevm_rpc: String) -> Result<Self> {
-        let endpoints = ChainRpcEndpoints {
-            ethereum: ethereum_rpc
-                .parse()
-                .wrap_err("failed to parse --ethereum-rpc as a URL")?,
-            hyperevm: hyperevm_rpc
-                .parse()
-                .wrap_err("failed to parse --hyperevm-rpc as a URL")?,
-        };
-
-        Ok(Self {
-            source: endpoints.for_chain(route.from()),
-            destination: endpoints.for_chain(route.to()),
-        })
+    fn from_resolved(endpoints: &ResolvedChainRpcEndpoints) -> Self {
+        Self {
+            source: endpoints.source.url.clone(),
+            destination: endpoints.destination.url.clone(),
+        }
     }
 }
 
-#[derive(Clone, Debug)]
-struct ChainRpcEndpoints {
-    ethereum: Url,
-    hyperevm: Url,
-}
+#[derive(Clone, Copy, Debug)]
+struct ChainEndpointCatalog;
 
-impl ChainRpcEndpoints {
-    fn for_chain(&self, chain: ChainArg) -> Url {
-        match chain {
-            ChainArg::Ethereum => self.ethereum.clone(),
-            ChainArg::HyperEvm => self.hyperevm.clone(),
-        }
+const CHAIN_ENDPOINT_CATALOG: ChainEndpointCatalog = ChainEndpointCatalog;
+
+const CHAIN_ENDPOINTS: &[ChainEndpoint] = &[
+    ChainEndpoint {
+        chain: ChainArg::Ethereum,
+        cli_flag: "--ethereum-rpc",
+        env_var: ETHEREUM_RPC_ENV,
+        config_field: "ethereum_rpc",
+        missing_message: "missing Ethereum RPC URL; set --ethereum-rpc, ETHEREUM_RPC_URL, or ethereum_rpc in the config file",
+        parse_error: "failed to parse --ethereum-rpc as a URL",
+    },
+    ChainEndpoint {
+        chain: ChainArg::HyperEvm,
+        cli_flag: "--hyperevm-rpc",
+        env_var: HYPEREVM_RPC_ENV,
+        config_field: "hyperevm_rpc",
+        missing_message: "missing HyperEVM RPC URL; set --hyperevm-rpc, HYPEREVM_RPC_URL, or hyperevm_rpc in the config file",
+        parse_error: "failed to parse --hyperevm-rpc as a URL",
+    },
+];
+
+impl ChainEndpointCatalog {
+    fn resolve_route<E>(
+        &self,
+        route: &RouteConfig,
+        args: &BridgeArgs,
+        file: &BridgeConfigFile,
+        env: &E,
+    ) -> Result<ResolvedChainRpcEndpoints>
+    where
+        E: EnvSource,
+    {
+        Ok(ResolvedChainRpcEndpoints {
+            source: self.resolve_endpoint(route.from(), args, file, env)?,
+            destination: self.resolve_endpoint(route.to(), args, file, env)?,
+        })
+    }
+
+    fn resolve_endpoint<E>(
+        &self,
+        chain: ChainArg,
+        args: &BridgeArgs,
+        file: &BridgeConfigFile,
+        env: &E,
+    ) -> Result<ResolvedChainRpcEndpoint>
+    where
+        E: EnvSource,
+    {
+        let endpoint = self.endpoint(chain)?;
+        let raw_endpoint = sourced_required_cli_env_file(
+            endpoint.cli_value(args),
+            endpoint.cli_flag,
+            env.get(endpoint.env_var),
+            endpoint.env_var,
+            endpoint.file_value(file),
+            endpoint.config_field,
+            endpoint.missing_message,
+        )?;
+        let url = raw_endpoint.value.parse().wrap_err(endpoint.parse_error)?;
+
+        Ok(ResolvedChainRpcEndpoint {
+            url,
+            config_source: raw_endpoint.source,
+        })
+    }
+
+    fn endpoint(&self, chain: ChainArg) -> Result<ChainEndpoint> {
+        self.endpoints()
+            .iter()
+            .copied()
+            .find(|endpoint| endpoint.chain == chain)
+            .ok_or_else(|| eyre!("missing RPC endpoint catalog entry for {chain}"))
+    }
+
+    const fn endpoints(&self) -> &'static [ChainEndpoint] {
+        CHAIN_ENDPOINTS
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChainRpcEndpointSources {
-    ethereum: ConfigValueSource,
-    hyperevm: ConfigValueSource,
+struct ChainEndpoint {
+    chain: ChainArg,
+    cli_flag: &'static str,
+    env_var: &'static str,
+    config_field: &'static str,
+    missing_message: &'static str,
+    parse_error: &'static str,
 }
 
-impl ChainRpcEndpointSources {
-    const fn for_chain(self, chain: ChainArg) -> ConfigValueSource {
-        match chain {
-            ChainArg::Ethereum => self.ethereum,
-            ChainArg::HyperEvm => self.hyperevm,
+impl ChainEndpoint {
+    fn cli_value(self, args: &BridgeArgs) -> Option<String> {
+        match self.chain {
+            ChainArg::Ethereum => args.ethereum_rpc.clone(),
+            ChainArg::HyperEvm => args.hyperevm_rpc.clone(),
         }
     }
+
+    fn file_value(self, file: &BridgeConfigFile) -> Option<String> {
+        match self.chain {
+            ChainArg::Ethereum => file.ethereum_rpc.clone(),
+            ChainArg::HyperEvm => file.hyperevm_rpc.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedChainRpcEndpoints {
+    source: ResolvedChainRpcEndpoint,
+    destination: ResolvedChainRpcEndpoint,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedChainRpcEndpoint {
+    url: Url,
+    config_source: ConfigValueSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2600,6 +2663,97 @@ mod tests {
         );
         assert!(
             message.contains("supported routes: ethereum -> hyperevm"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_resolves_route_endpoint_roles_and_provenance() {
+        let route = supported_route_config();
+        let mut args = empty_args();
+        args.ethereum_rpc = Some("https://source.example".to_owned());
+        args.hyperevm_rpc = Some("https://destination.example".to_owned());
+
+        let endpoints = CHAIN_ENDPOINT_CATALOG
+            .resolve_route(
+                &route,
+                &args,
+                &BridgeConfigFile::default(),
+                &TestEnv::default(),
+            )
+            .expect("endpoint catalog resolves current route");
+        let rpc = RpcEndpoints::from_resolved(&endpoints);
+        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
+
+        assert_eq!(rpc.source.as_str(), "https://source.example/");
+        assert_eq!(rpc.destination.as_str(), "https://destination.example/");
+        assert_eq!(
+            provenance.source.source,
+            ConfigValueSource::CliFlag("--ethereum-rpc")
+        );
+        assert_eq!(
+            provenance.destination.source,
+            ConfigValueSource::CliFlag("--hyperevm-rpc")
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_maps_sources_by_chain_after_precedence() {
+        let route = supported_route_config();
+        let mut args = empty_args();
+        args.hyperevm_rpc = Some("https://cli.hyperevm.example".to_owned());
+        let file = BridgeConfigFile {
+            ethereum_rpc: Some("https://file.ethereum.example".to_owned()),
+            hyperevm_rpc: Some("https://file.hyperevm.example".to_owned()),
+            ..BridgeConfigFile::default()
+        };
+        let env = TestEnv(HashMap::from([(
+            ETHEREUM_RPC_ENV.to_owned(),
+            "https://env.ethereum.example".to_owned(),
+        )]));
+
+        let endpoints = CHAIN_ENDPOINT_CATALOG
+            .resolve_route(&route, &args, &file, &env)
+            .expect("endpoint catalog applies per-chain precedence");
+        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
+
+        assert_eq!(
+            endpoints.source.url.as_str(),
+            "https://env.ethereum.example/"
+        );
+        assert_eq!(
+            endpoints.destination.url.as_str(),
+            "https://cli.hyperevm.example/"
+        );
+        assert_eq!(
+            provenance.source.source,
+            ConfigValueSource::EnvVar(ETHEREUM_RPC_ENV)
+        );
+        assert_eq!(
+            provenance.destination.source,
+            ConfigValueSource::CliFlag("--hyperevm-rpc")
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_reports_chain_specific_parse_error() {
+        let route = supported_route_config();
+        let mut args = empty_args();
+        args.ethereum_rpc = Some("not a url".to_owned());
+        args.hyperevm_rpc = Some("https://destination.example".to_owned());
+
+        let error = CHAIN_ENDPOINT_CATALOG
+            .resolve_route(
+                &route,
+                &args,
+                &BridgeConfigFile::default(),
+                &TestEnv::default(),
+            )
+            .expect_err("invalid source endpoint is rejected");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("failed to parse --ethereum-rpc as a URL"),
             "unexpected error: {message}"
         );
     }
