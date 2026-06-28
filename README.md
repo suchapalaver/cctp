@@ -3,9 +3,11 @@
 Small Trezor-backed CLI for bridging USDC with
 [`cctp-rs`](https://crates.io/crates/cctp-rs).
 
-The first supported route is Ethereum mainnet to HyperEVM. The CLI uses Alloy's
-Trezor signer support and defaults to waiting for any permissionless relayer to
-complete the destination mint.
+The default supported production route is Ethereum mainnet to HyperEVM. The CLI
+also has an explicit Ethereum Sepolia to Base Sepolia testnet route for dry-run
+and test-funds validation before operational use. The CLI uses Alloy's Trezor
+signer support and defaults to waiting for any permissionless relayer to complete
+the destination mint.
 
 ## Install
 
@@ -71,6 +73,26 @@ cctp bridge \
   --recipient 0x0000000000000000000000000000000000000000
 ```
 
+For testnet validation, choose the testnet route explicitly and provide matching
+testnet RPC endpoints:
+
+```sh
+export ETHEREUM_SEPOLIA_RPC_URL="https://..."
+export BASE_SEPOLIA_RPC_URL="https://..."
+
+cctp bridge \
+  --from ethereum-sepolia \
+  --to base-sepolia \
+  --amount 1 \
+  --dry-run
+```
+
+The testnet route defaults to Circle's Ethereum Sepolia USDC address
+`0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238`. Use Circle's faucet for testnet
+USDC and ensure the selected Trezor account has Sepolia ETH for gas. Add
+`--self-relay` only when the same account also has Base Sepolia ETH for the
+destination `receiveMessage` transaction.
+
 The CLI also loads `.env` from the current directory or a parent directory
 before resolving configuration. Keep real RPC URLs in local `.env`;
 `.env.example` documents the supported variable names and `.env` is ignored by
@@ -114,6 +136,7 @@ Supported routes are explicit CLI catalog entries:
 | From | To | Notes |
 | --- | --- | --- |
 | `ethereum` | `hyperevm` | Ethereum mainnet to HyperEVM CCTP v2. |
+| `ethereum-sepolia` | `base-sepolia` | Explicit testnet route for dry-run and test-funds validation. |
 
 Unsupported routes fail during config resolution before wallet initialization.
 
@@ -153,13 +176,15 @@ config instead of reading flags or environment variables directly.
 Precedence is:
 
 1. CLI flags.
-2. Environment variables for RPC URLs: `ETHEREUM_RPC_URL` and
-   `HYPEREVM_RPC_URL`.
+2. Environment variables for RPC URLs: `ETHEREUM_RPC_URL`,
+   `HYPEREVM_RPC_URL`, `ETHEREUM_SEPOLIA_RPC_URL`, and
+   `BASE_SEPOLIA_RPC_URL`.
 3. TOML config file passed with `--config`.
 4. Built-in defaults for route, wallet, account, relay mode, and transfer mode.
 
-`amount`, `ethereum_rpc`, and `hyperevm_rpc` must be supplied by CLI, env, or
-config file. Example:
+`amount` and the RPC fields for the selected route must be supplied by CLI, env,
+or config file. The default production route requires `ethereum_rpc` and
+`hyperevm_rpc`. Example:
 
 ```toml
 amount = "10.25"
@@ -170,6 +195,17 @@ trezor_account = 0
 fast = false
 self_relay = false
 dry_run = false
+```
+
+The explicit testnet route uses route-specific RPC fields:
+
+```toml
+from = "ethereum-sepolia"
+to = "base-sepolia"
+amount = "1"
+ethereum_sepolia_rpc = "https://..."
+base_sepolia_rpc = "https://..."
+dry_run = true
 ```
 
 Run with:

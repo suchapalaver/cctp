@@ -24,9 +24,12 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const MAINNET_USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+const ETHEREUM_SEPOLIA_USDC: Address = address!("1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 const DEFAULT_LOG_FILTER: &str = "info,cctp_rs=info";
 const ETHEREUM_RPC_ENV: &str = "ETHEREUM_RPC_URL";
 const HYPEREVM_RPC_ENV: &str = "HYPEREVM_RPC_URL";
+const ETHEREUM_SEPOLIA_RPC_ENV: &str = "ETHEREUM_SEPOLIA_RPC_URL";
+const BASE_SEPOLIA_RPC_ENV: &str = "BASE_SEPOLIA_RPC_URL";
 const DEFAULT_FAST_FEE_BUFFER_PERCENT: u32 = 20;
 
 #[derive(Debug, Parser)]
@@ -72,6 +75,14 @@ struct BridgeArgs {
     /// HyperEVM RPC URL.
     #[arg(long)]
     hyperevm_rpc: Option<String>,
+
+    /// Ethereum Sepolia testnet RPC URL.
+    #[arg(long)]
+    ethereum_sepolia_rpc: Option<String>,
+
+    /// Base Sepolia testnet RPC URL.
+    #[arg(long)]
+    base_sepolia_rpc: Option<String>,
 
     /// Wallet backend.
     #[arg(long, value_enum)]
@@ -154,6 +165,12 @@ enum ChainArg {
     #[value(name = "hyperevm", alias = "hyper-evm", alias = "hyperliquid")]
     #[serde(rename = "hyperevm", alias = "hyper-evm", alias = "hyperliquid")]
     HyperEvm,
+    #[value(name = "ethereum-sepolia", alias = "sepolia")]
+    #[serde(rename = "ethereum-sepolia", alias = "sepolia")]
+    EthereumSepolia,
+    #[value(name = "base-sepolia")]
+    #[serde(rename = "base-sepolia")]
+    BaseSepolia,
 }
 
 impl std::fmt::Display for ChainArg {
@@ -161,6 +178,8 @@ impl std::fmt::Display for ChainArg {
         match self {
             Self::Ethereum => f.write_str("ethereum"),
             Self::HyperEvm => f.write_str("hyperevm"),
+            Self::EthereumSepolia => f.write_str("ethereum-sepolia"),
+            Self::BaseSepolia => f.write_str("base-sepolia"),
         }
     }
 }
@@ -170,6 +189,8 @@ impl ChainArg {
         match self {
             Self::Ethereum => NamedChain::Mainnet,
             Self::HyperEvm => NamedChain::Hyperliquid,
+            Self::EthereumSepolia => NamedChain::Sepolia,
+            Self::BaseSepolia => NamedChain::BaseSepolia,
         }
     }
 }
@@ -544,6 +565,8 @@ struct BridgeConfigFile {
     recipient: Option<Address>,
     ethereum_rpc: Option<String>,
     hyperevm_rpc: Option<String>,
+    ethereum_sepolia_rpc: Option<String>,
+    base_sepolia_rpc: Option<String>,
     wallet: Option<WalletKind>,
     trezor_account: Option<u32>,
     relay_trezor_account: Option<u32>,
@@ -1307,13 +1330,22 @@ struct RouteCatalog;
 
 const ROUTE_CATALOG: RouteCatalog = RouteCatalog;
 
-const SUPPORTED_ROUTES: &[SupportedRoute] = &[SupportedRoute {
-    from: ChainArg::Ethereum,
-    to: ChainArg::HyperEvm,
-    source_label: "Ethereum mainnet",
-    destination_label: "HyperEVM",
-    default_usdc: MAINNET_USDC,
-}];
+const SUPPORTED_ROUTES: &[SupportedRoute] = &[
+    SupportedRoute {
+        from: ChainArg::Ethereum,
+        to: ChainArg::HyperEvm,
+        source_label: "Ethereum mainnet",
+        destination_label: "HyperEVM",
+        default_usdc: MAINNET_USDC,
+    },
+    SupportedRoute {
+        from: ChainArg::EthereumSepolia,
+        to: ChainArg::BaseSepolia,
+        source_label: "Ethereum Sepolia testnet",
+        destination_label: "Base Sepolia testnet",
+        default_usdc: ETHEREUM_SEPOLIA_USDC,
+    },
+];
 
 impl RouteCatalog {
     fn resolve(&self, from: ChainArg, to: ChainArg) -> Result<RouteConfig> {
@@ -1381,6 +1413,22 @@ const CHAIN_ENDPOINTS: &[ChainEndpoint] = &[
         config_field: "hyperevm_rpc",
         missing_message: "missing HyperEVM RPC URL; set --hyperevm-rpc, HYPEREVM_RPC_URL, or hyperevm_rpc in the config file",
         parse_error: "failed to parse --hyperevm-rpc as a URL",
+    },
+    ChainEndpoint {
+        chain: ChainArg::EthereumSepolia,
+        cli_flag: "--ethereum-sepolia-rpc",
+        env_var: ETHEREUM_SEPOLIA_RPC_ENV,
+        config_field: "ethereum_sepolia_rpc",
+        missing_message: "missing Ethereum Sepolia RPC URL; set --ethereum-sepolia-rpc, ETHEREUM_SEPOLIA_RPC_URL, or ethereum_sepolia_rpc in the config file",
+        parse_error: "failed to parse --ethereum-sepolia-rpc as a URL",
+    },
+    ChainEndpoint {
+        chain: ChainArg::BaseSepolia,
+        cli_flag: "--base-sepolia-rpc",
+        env_var: BASE_SEPOLIA_RPC_ENV,
+        config_field: "base_sepolia_rpc",
+        missing_message: "missing Base Sepolia RPC URL; set --base-sepolia-rpc, BASE_SEPOLIA_RPC_URL, or base_sepolia_rpc in the config file",
+        parse_error: "failed to parse --base-sepolia-rpc as a URL",
     },
 ];
 
@@ -1457,6 +1505,8 @@ impl ChainEndpoint {
         match self.chain {
             ChainArg::Ethereum => args.ethereum_rpc.clone(),
             ChainArg::HyperEvm => args.hyperevm_rpc.clone(),
+            ChainArg::EthereumSepolia => args.ethereum_sepolia_rpc.clone(),
+            ChainArg::BaseSepolia => args.base_sepolia_rpc.clone(),
         }
     }
 
@@ -1464,6 +1514,8 @@ impl ChainEndpoint {
         match self.chain {
             ChainArg::Ethereum => file.ethereum_rpc.clone(),
             ChainArg::HyperEvm => file.hyperevm_rpc.clone(),
+            ChainArg::EthereumSepolia => file.ethereum_sepolia_rpc.clone(),
+            ChainArg::BaseSepolia => file.base_sepolia_rpc.clone(),
         }
     }
 }
@@ -2545,6 +2597,8 @@ mod tests {
             recipient: None,
             ethereum_rpc: None,
             hyperevm_rpc: None,
+            ethereum_sepolia_rpc: None,
+            base_sepolia_rpc: None,
             wallet: None,
             trezor_account: None,
             relay_trezor_account: None,
@@ -2566,6 +2620,19 @@ mod tests {
             amount: Some("1.25".to_owned()),
             ethereum_rpc: Some("https://ethereum.example".to_owned()),
             hyperevm_rpc: Some("https://hyperevm.example".to_owned()),
+            wallet: Some(WalletKind::Trezor),
+            trezor_account: Some(0),
+            ..empty_args()
+        }
+    }
+
+    fn testnet_args() -> BridgeArgs {
+        BridgeArgs {
+            from: Some(ChainArg::EthereumSepolia),
+            to: Some(ChainArg::BaseSepolia),
+            amount: Some("1.25".to_owned()),
+            ethereum_sepolia_rpc: Some("https://ethereum-sepolia.example".to_owned()),
+            base_sepolia_rpc: Some("https://base-sepolia.example".to_owned()),
             wallet: Some(WalletKind::Trezor),
             trezor_account: Some(0),
             ..empty_args()
@@ -2637,6 +2704,43 @@ mod tests {
     }
 
     #[test]
+    fn config_service_builds_explicit_testnet_bridge_config() {
+        let config = empty_service()
+            .bridge_config(testnet_args())
+            .expect("valid testnet config");
+
+        assert_eq!(
+            config.route.cctp_route().source_chain(),
+            NamedChain::Sepolia
+        );
+        assert_eq!(
+            config.route.cctp_route().destination_chain(),
+            NamedChain::BaseSepolia
+        );
+        assert_eq!(config.route.source_label(), "Ethereum Sepolia testnet");
+        assert_eq!(config.route.destination_label(), "Base Sepolia testnet");
+        assert_eq!(config.route.source_chain_id(), 11_155_111);
+        assert_eq!(config.route.destination_chain_id(), 84_532);
+        assert_eq!(config.usdc, ETHEREUM_SEPOLIA_USDC);
+        assert_eq!(
+            config.rpc.source.as_str(),
+            "https://ethereum-sepolia.example/"
+        );
+        assert_eq!(
+            config.rpc.destination.as_str(),
+            "https://base-sepolia.example/"
+        );
+        assert_eq!(
+            config.provenance.rpc.source.source,
+            ConfigValueSource::CliFlag("--ethereum-sepolia-rpc")
+        );
+        assert_eq!(
+            config.provenance.rpc.destination.source,
+            ConfigValueSource::CliFlag("--base-sepolia-rpc")
+        );
+    }
+
+    #[test]
     fn route_catalog_resolves_supported_route() {
         let route = supported_route_config();
 
@@ -2648,6 +2752,20 @@ mod tests {
         assert_eq!(route.source_label(), "Ethereum mainnet");
         assert_eq!(route.destination_label(), "HyperEVM");
         assert_eq!(route.default_usdc(), MAINNET_USDC);
+    }
+
+    #[test]
+    fn route_catalog_resolves_explicit_testnet_route() {
+        let route = testnet_route_config();
+
+        assert_eq!(route.cctp_route().source_chain(), NamedChain::Sepolia);
+        assert_eq!(
+            route.cctp_route().destination_chain(),
+            NamedChain::BaseSepolia
+        );
+        assert_eq!(route.source_label(), "Ethereum Sepolia testnet");
+        assert_eq!(route.destination_label(), "Base Sepolia testnet");
+        assert_eq!(route.default_usdc(), ETHEREUM_SEPOLIA_USDC);
     }
 
     #[test]
@@ -2663,6 +2781,10 @@ mod tests {
         );
         assert!(
             message.contains("supported routes: ethereum -> hyperevm"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("ethereum-sepolia -> base-sepolia"),
             "unexpected error: {message}"
         );
     }
@@ -2694,6 +2816,77 @@ mod tests {
         assert_eq!(
             provenance.destination.source,
             ConfigValueSource::CliFlag("--hyperevm-rpc")
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_resolves_testnet_endpoint_roles_and_provenance() {
+        let route = testnet_route_config();
+        let mut args = empty_args();
+        args.ethereum_sepolia_rpc = Some("https://source-testnet.example".to_owned());
+        args.base_sepolia_rpc = Some("https://destination-testnet.example".to_owned());
+
+        let endpoints = CHAIN_ENDPOINT_CATALOG
+            .resolve_route(
+                &route,
+                &args,
+                &BridgeConfigFile::default(),
+                &TestEnv::default(),
+            )
+            .expect("endpoint catalog resolves testnet route");
+        let rpc = RpcEndpoints::from_resolved(&endpoints);
+        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
+
+        assert_eq!(rpc.source.as_str(), "https://source-testnet.example/");
+        assert_eq!(
+            rpc.destination.as_str(),
+            "https://destination-testnet.example/"
+        );
+        assert_eq!(
+            provenance.source.source,
+            ConfigValueSource::CliFlag("--ethereum-sepolia-rpc")
+        );
+        assert_eq!(
+            provenance.destination.source,
+            ConfigValueSource::CliFlag("--base-sepolia-rpc")
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_maps_testnet_sources_by_chain_after_precedence() {
+        let route = testnet_route_config();
+        let mut args = empty_args();
+        args.base_sepolia_rpc = Some("https://cli.base-sepolia.example".to_owned());
+        let file = BridgeConfigFile {
+            ethereum_sepolia_rpc: Some("https://file.ethereum-sepolia.example".to_owned()),
+            base_sepolia_rpc: Some("https://file.base-sepolia.example".to_owned()),
+            ..BridgeConfigFile::default()
+        };
+        let env = TestEnv(HashMap::from([(
+            ETHEREUM_SEPOLIA_RPC_ENV.to_owned(),
+            "https://env.ethereum-sepolia.example".to_owned(),
+        )]));
+
+        let endpoints = CHAIN_ENDPOINT_CATALOG
+            .resolve_route(&route, &args, &file, &env)
+            .expect("endpoint catalog applies per-chain testnet precedence");
+        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
+
+        assert_eq!(
+            endpoints.source.url.as_str(),
+            "https://env.ethereum-sepolia.example/"
+        );
+        assert_eq!(
+            endpoints.destination.url.as_str(),
+            "https://cli.base-sepolia.example/"
+        );
+        assert_eq!(
+            provenance.source.source,
+            ConfigValueSource::EnvVar(ETHEREUM_SEPOLIA_RPC_ENV)
+        );
+        assert_eq!(
+            provenance.destination.source,
+            ConfigValueSource::CliFlag("--base-sepolia-rpc")
         );
     }
 
@@ -2771,6 +2964,27 @@ mod tests {
 
         assert!(
             message.contains("unsupported route hyperevm -> ethereum"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("missing amount"),
+            "route policy should fail before later config checks: {message}"
+        );
+    }
+
+    #[test]
+    fn config_service_rejects_mixed_mainnet_testnet_route_before_required_inputs() {
+        let mut args = empty_args();
+        args.from = Some(ChainArg::Ethereum);
+        args.to = Some(ChainArg::BaseSepolia);
+
+        let error = empty_service()
+            .bridge_config(args)
+            .expect_err("mixed mainnet/testnet route is invalid");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("unsupported route ethereum -> base-sepolia"),
             "unexpected error: {message}"
         );
         assert!(
@@ -3253,6 +3467,34 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[test]
+    fn provider_validation_accepts_testnet_chain_ids() {
+        let route = testnet_route_config();
+
+        let validation =
+            ProviderValidation::new(route, route.source_chain_id(), route.destination_chain_id())
+                .expect("testnet chain IDs match");
+
+        assert_eq!(
+            validation.source,
+            ProviderChainCheck {
+                role: ProviderEndpointRole::Source,
+                chain_label: "Ethereum Sepolia testnet",
+                expected_chain_id: 11_155_111,
+                actual_chain_id: 11_155_111
+            }
+        );
+        assert_eq!(
+            validation.destination,
+            ProviderChainCheck {
+                role: ProviderEndpointRole::Destination,
+                chain_label: "Base Sepolia testnet",
+                expected_chain_id: 84_532,
+                actual_chain_id: 84_532
+            }
+        );
+    }
+
+    #[test]
     fn provider_validation_rejects_source_chain_mismatch_with_route_context() {
         let route = supported_route_config();
 
@@ -3273,6 +3515,29 @@ hyperevm_rpc = "https://file.hyperevm.example"
             "unexpected error: {message}"
         );
         assert!(message.contains("got 31337"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn provider_validation_rejects_mainnet_rpc_for_testnet_route_context() {
+        let route = testnet_route_config();
+
+        let error = ProviderValidation::new(route, 1, route.destination_chain_id())
+            .expect_err("mainnet RPC on testnet route is invalid");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("source RPC"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Ethereum Sepolia testnet -> Base Sepolia testnet"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("expected 11155111"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("got 1"), "unexpected error: {message}");
     }
 
     #[test]
@@ -3439,6 +3704,30 @@ hyperevm_rpc = "https://file.hyperevm.example"
         );
     }
 
+    #[tokio::test]
+    async fn bridge_app_rejects_testnet_rpc_mismatch_before_wallet_initialization() {
+        let calls = SharedCalls::default();
+        let config = empty_service()
+            .bridge_config(testnet_args())
+            .expect("valid testnet config");
+        let app = mock_bridge_app_with_provider_chain_ids(calls.clone(), 1, 84_532);
+
+        let error = app
+            .run(config)
+            .await
+            .expect_err("testnet route with mainnet source RPC is invalid");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("source RPC"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            calls.entries(),
+            vec!["read_only_providers", "validate_providers"]
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct SharedCalls(Rc<RefCell<Vec<&'static str>>>);
 
@@ -3571,6 +3860,8 @@ hyperevm_rpc = "https://file.hyperevm.example"
     #[derive(Clone, Debug)]
     struct MockProviderValidationService {
         calls: SharedCalls,
+        source_chain_id: Option<u64>,
+        destination_chain_id: Option<u64>,
     }
 
     #[async_trait(?Send)]
@@ -3583,8 +3874,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
             self.calls.push("validate_providers");
             ProviderValidation::new(
                 config.route,
-                config.route.source_chain_id(),
-                config.route.destination_chain_id(),
+                self.source_chain_id
+                    .unwrap_or_else(|| config.route.source_chain_id()),
+                self.destination_chain_id
+                    .unwrap_or_else(|| config.route.destination_chain_id()),
             )
         }
     }
@@ -3655,6 +3948,54 @@ hyperevm_rpc = "https://file.hyperevm.example"
         MockApprovalService,
         MockReporter,
     > {
+        mock_bridge_app_with_provider_validation(
+            calls,
+            MockProviderValidationService {
+                calls: SharedCalls::default(),
+                source_chain_id: None,
+                destination_chain_id: None,
+            },
+        )
+    }
+
+    fn mock_bridge_app_with_provider_chain_ids(
+        calls: SharedCalls,
+        source_chain_id: u64,
+        destination_chain_id: u64,
+    ) -> BridgeApp<
+        MockWalletService,
+        MockProviderService,
+        MockProviderValidationService,
+        MockFeeResolutionService,
+        MockApprovalService,
+        MockReporter,
+    > {
+        mock_bridge_app_with_provider_validation(
+            calls.clone(),
+            MockProviderValidationService {
+                calls,
+                source_chain_id: Some(source_chain_id),
+                destination_chain_id: Some(destination_chain_id),
+            },
+        )
+    }
+
+    fn mock_bridge_app_with_provider_validation(
+        calls: SharedCalls,
+        provider_validation_service: MockProviderValidationService,
+    ) -> BridgeApp<
+        MockWalletService,
+        MockProviderService,
+        MockProviderValidationService,
+        MockFeeResolutionService,
+        MockApprovalService,
+        MockReporter,
+    > {
+        let provider_validation_service = MockProviderValidationService {
+            calls: calls.clone(),
+            ..provider_validation_service
+        };
+
         BridgeApp::new(
             MockWalletService {
                 calls: calls.clone(),
@@ -3662,9 +4003,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             MockProviderService {
                 calls: calls.clone(),
             },
-            MockProviderValidationService {
-                calls: calls.clone(),
-            },
+            provider_validation_service,
             MockFeeResolutionService {
                 calls: calls.clone(),
             },
@@ -3790,6 +4129,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
         ROUTE_CATALOG
             .resolve(ChainArg::Ethereum, ChainArg::HyperEvm)
             .expect("supported route")
+    }
+
+    fn testnet_route_config() -> RouteConfig {
+        ROUTE_CATALOG
+            .resolve(ChainArg::EthereumSepolia, ChainArg::BaseSepolia)
+            .expect("supported testnet route")
     }
 
     fn mock_workflow(
