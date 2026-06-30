@@ -123,13 +123,15 @@ cctp bridge \
   --max-fee-usdc 0.01
 ```
 
-By default the CLI waits for any relayer to complete the mint on HyperEVM. It
-uses a read-only HyperEVM provider and does not initialize a destination signer
-or require HyperEVM gas.
+By default the CLI waits for any relayer to complete the destination mint. It
+uses a read-only destination provider and does not initialize a destination
+signer or require destination-chain gas in the Trezor account.
 
-To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
-The relay signer defaults to `--trezor-account`, but can be selected
-independently with `--relay-trezor-account`.
+To self-relay, add `--self-relay`; the relay account must hold gas on the
+destination chain: HyperEVM for `ethereum -> hyperevm`, or Base Sepolia for
+`ethereum-sepolia -> base-sepolia`. The relay signer defaults to
+`--trezor-account`, but can be selected independently with
+`--relay-trezor-account`.
 
 Supported routes are explicit CLI catalog entries:
 
