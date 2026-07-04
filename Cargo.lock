@@ -1302,6 +1302,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing-subscriber",

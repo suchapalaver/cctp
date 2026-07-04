@@ -18,7 +18,7 @@ use cctp_rs::{
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -154,6 +154,10 @@ struct BridgeArgs {
     /// Intended for explicit non-interactive automation. Ignored by --dry-run.
     #[arg(long)]
     yes: bool,
+
+    /// Reporter output mode.
+    #[arg(long, value_enum)]
+    output: Option<OutputMode>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -210,13 +214,32 @@ impl std::fmt::Display for WalletKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum OutputMode {
+    Human,
+    Json,
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Human => f.write_str("human"),
+            Self::Json => f.write_str("json"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     load_dotenv()?;
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .init();
 
     let cli = Cli::parse();
     match cli.command {
@@ -234,7 +257,10 @@ fn load_dotenv() -> Result<()> {
 
 async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let config = CliConfigService::default().bridge_config(args)?;
-    BridgeApp::production().run(config).await.map(|_| ())
+    BridgeApp::production(config.output)
+        .run(config)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -253,18 +279,18 @@ type ProductionBridgeApp = BridgeApp<
     AlloyProviderValidationService,
     CctpFeeResolutionService,
     TerminalIntentApprovalService,
-    HumanReporter,
+    ConfiguredReporter,
 >;
 
 impl ProductionBridgeApp {
-    const fn production() -> Self {
+    fn production(output: OutputMode) -> Self {
         Self::new(
             TrezorWalletService,
             AlloyProviderService,
             AlloyProviderValidationService,
             CctpFeeResolutionService,
             TerminalIntentApprovalService,
-            HumanReporter,
+            ConfiguredReporter::from_output_mode(output),
         )
     }
 }
@@ -340,16 +366,16 @@ where
             contracts,
             resolved_transfer.clone(),
         );
-        self.reporter.report_intent(&intent);
+        self.reporter.report_intent(&intent)?;
 
         if config.dry_run {
-            self.reporter.report_dry_run_complete();
+            self.reporter.report_dry_run_complete()?;
             return Ok(BridgeRunResult::DryRun);
         }
 
         self.approval_service
             .confirm(&intent, config.confirmation)?;
-        self.reporter.report_workflow_start();
+        self.reporter.report_workflow_start()?;
 
         let runtime = self.provider_service.runtime(bridge, providers);
         let mut workflow = BridgeWorkflow::new(
@@ -360,7 +386,7 @@ where
             relay_signer_address,
         );
         let outcome = workflow.run().await?;
-        self.reporter.report_outcome(&outcome);
+        self.reporter.report_outcome(&outcome)?;
         Ok(BridgeRunResult::Executed(outcome))
     }
 }
@@ -491,6 +517,14 @@ where
             )
         };
         let dry_run = args.dry_run.or(file.dry_run).unwrap_or(false);
+        let output = sourced_cli_file_default(
+            args.output,
+            "--output",
+            file.output,
+            "output",
+            OutputMode::Human,
+            "human",
+        );
         let receive_polling = ReceivePolling::new(
             args.receive_attempts.or(file.receive_attempts),
             args.receive_interval_secs.or(file.receive_interval_secs),
@@ -536,6 +570,7 @@ where
                 &transfer,
                 max_fee_usdc.as_ref().map(|max_fee| max_fee.source),
             )?,
+            output: output.source,
         };
 
         Ok(BridgeConfig {
@@ -551,6 +586,7 @@ where
             receive_polling,
             dry_run,
             confirmation: ConfirmationPolicy::from_yes(args.yes),
+            output: output.value,
             provenance,
         })
     }
@@ -577,6 +613,7 @@ struct BridgeConfigFile {
     receive_attempts: Option<u32>,
     receive_interval_secs: Option<u64>,
     dry_run: Option<bool>,
+    output: Option<OutputMode>,
 }
 
 impl BridgeConfigFile {
@@ -703,6 +740,7 @@ struct BridgeConfigProvenance {
     relay_mode: ConfigValueSource,
     fast_mode: ConfigValueSource,
     max_fee: MaxFeeProvenance,
+    output: ConfigValueSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -891,6 +929,7 @@ struct BridgeConfig {
     receive_polling: ReceivePolling,
     dry_run: bool,
     confirmation: ConfirmationPolicy,
+    output: OutputMode,
     provenance: BridgeConfigProvenance,
 }
 
@@ -1608,15 +1647,20 @@ impl IntentApprovalService for TerminalIntentApprovalService {
     fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()> {
         match policy {
             ConfirmationPolicy::SkipPrompt => {
-                println!("Confirmation skipped by --yes.");
+                let mut stderr = io::stderr().lock();
+                writeln!(stderr, "Confirmation skipped by --yes.")
+                    .wrap_err("failed to write confirmation status")?;
                 Ok(())
             }
             ConfirmationPolicy::RequireInteractive => {
-                print!(
+                let mut stderr = io::stderr().lock();
+                write!(
+                    stderr,
                     "Type CONFIRM to sign and submit this bridge intent for {} USDC: ",
                     intent.amount
-                );
-                io::stdout()
+                )
+                .wrap_err("failed to write confirmation prompt")?;
+                stderr
                     .flush()
                     .wrap_err("failed to flush confirmation prompt")?;
 
@@ -2343,34 +2387,83 @@ impl BridgeIntent {
     }
 }
 
+#[derive(Clone, Debug)]
+enum ConfiguredReporter {
+    Human(HumanReporter),
+    Json(JsonReporter),
+}
+
+impl ConfiguredReporter {
+    fn from_output_mode(output: OutputMode) -> Self {
+        match output {
+            OutputMode::Human => Self::Human(HumanReporter),
+            OutputMode::Json => Self::Json(JsonReporter::stdout()),
+        }
+    }
+}
+
+impl Reporter for ConfiguredReporter {
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_intent(reporter, intent),
+            Self::Json(reporter) => reporter.report_intent(intent),
+        }
+    }
+
+    fn report_dry_run_complete(&self) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_dry_run_complete(reporter),
+            Self::Json(reporter) => reporter.report_dry_run_complete(),
+        }
+    }
+
+    fn report_workflow_start(&self) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_workflow_start(reporter),
+            Self::Json(reporter) => reporter.report_workflow_start(),
+        }
+    }
+
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_outcome(reporter, outcome),
+            Self::Json(reporter) => reporter.report_outcome(outcome),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct HumanReporter;
 
 trait Reporter {
-    fn report_intent(&self, intent: &BridgeIntent);
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()>;
 
-    fn report_dry_run_complete(&self);
+    fn report_dry_run_complete(&self) -> Result<()>;
 
-    fn report_workflow_start(&self);
+    fn report_workflow_start(&self) -> Result<()>;
 
-    fn report_outcome(&self, outcome: &BridgeOutcome);
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()>;
 }
 
 impl Reporter for HumanReporter {
-    fn report_intent(&self, intent: &BridgeIntent) {
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
         HumanReporter::report_intent(self, intent);
+        Ok(())
     }
 
-    fn report_dry_run_complete(&self) {
+    fn report_dry_run_complete(&self) -> Result<()> {
         HumanReporter::report_dry_run_complete(self);
+        Ok(())
     }
 
-    fn report_workflow_start(&self) {
+    fn report_workflow_start(&self) -> Result<()> {
         HumanReporter::report_workflow_start(self);
+        Ok(())
     }
 
-    fn report_outcome(&self, outcome: &BridgeOutcome) {
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
         HumanReporter::report_outcome(self, outcome);
+        Ok(())
     }
 }
 
@@ -2520,6 +2613,453 @@ impl HumanReporter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct JsonReporter<S = StdoutJsonReportSink> {
+    sink: S,
+}
+
+impl JsonReporter<StdoutJsonReportSink> {
+    const fn stdout() -> Self {
+        Self {
+            sink: StdoutJsonReportSink,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<S> JsonReporter<S> {
+    const fn new(sink: S) -> Self {
+        Self { sink }
+    }
+}
+
+impl<S> Reporter for JsonReporter<S>
+where
+    S: JsonReportSink,
+{
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
+        self.report_event("bridge_intent", json_bridge_intent(intent))
+    }
+
+    fn report_dry_run_complete(&self) -> Result<()> {
+        self.report_event(
+            "dry_run_complete",
+            JsonDryRunComplete {
+                status: "complete",
+                transactions_sent: false,
+            },
+        )
+    }
+
+    fn report_workflow_start(&self) -> Result<()> {
+        self.report_event("workflow_start", JsonWorkflowStart { status: "started" })
+    }
+
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
+        self.report_event("bridge_outcome", json_bridge_outcome(outcome))
+    }
+}
+
+impl<S> JsonReporter<S>
+where
+    S: JsonReportSink,
+{
+    fn report_event<T>(&self, event: &'static str, data: T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        self.sink.write_json(&JsonReportEvent { event, data })
+    }
+}
+
+trait JsonReportSink {
+    fn write_json<T>(&self, value: &T) -> Result<()>
+    where
+        T: Serialize;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StdoutJsonReportSink;
+
+impl JsonReportSink for StdoutJsonReportSink {
+    fn write_json<T>(&self, value: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer(&mut stdout, value).wrap_err("failed to write JSON report")?;
+        writeln!(stdout).wrap_err("failed to finish JSON report line")
+    }
+}
+
+#[derive(Serialize)]
+struct JsonReportEvent<T>
+where
+    T: Serialize,
+{
+    event: &'static str,
+    data: T,
+}
+
+#[derive(Serialize)]
+struct JsonBridgeIntent {
+    route: JsonRoute,
+    signer: JsonWalletAccount,
+    relay_signer: Option<JsonWalletAccount>,
+    recipient: String,
+    usdc: String,
+    amount: JsonAmount,
+    mode: JsonTransferMode,
+    relay_policy: JsonRelayPolicy,
+    provider_checks: JsonProviderChecks,
+    contracts: JsonContracts,
+    provenance: JsonIntentProvenance,
+}
+
+#[derive(Serialize)]
+struct JsonRoute {
+    label: String,
+    source: JsonChain,
+    destination: JsonChain,
+}
+
+#[derive(Serialize)]
+struct JsonChain {
+    cli: String,
+    label: &'static str,
+    chain_id: u64,
+}
+
+#[derive(Serialize)]
+struct JsonWalletAccount {
+    role: String,
+    wallet: String,
+    derivation_path: String,
+    chain: JsonAccountChain,
+    address: String,
+}
+
+#[derive(Serialize)]
+struct JsonAccountChain {
+    label: &'static str,
+    chain_id: u64,
+}
+
+#[derive(Serialize)]
+struct JsonAmount {
+    usdc: String,
+    atomic: String,
+}
+
+#[derive(Serialize)]
+struct JsonTransferMode {
+    mode: &'static str,
+    fast_fee: Option<JsonFastFee>,
+}
+
+#[derive(Serialize)]
+struct JsonFastFee {
+    live_fee_bps: String,
+    live_fee_amount: JsonAmount,
+    max_fee: JsonAmount,
+    cap_source: String,
+}
+
+#[derive(Serialize)]
+struct JsonRelayPolicy {
+    mode: String,
+    source: String,
+    relay_signer_required: bool,
+    destination_provider: &'static str,
+    relay_wallet: String,
+}
+
+#[derive(Serialize)]
+struct JsonProviderChecks {
+    source: JsonProviderCheck,
+    destination: JsonProviderCheck,
+}
+
+#[derive(Serialize)]
+struct JsonProviderCheck {
+    role: &'static str,
+    chain_label: &'static str,
+    expected_chain_id: u64,
+    actual_chain_id: u64,
+    endpoint: JsonRpcEndpoint,
+}
+
+#[derive(Serialize)]
+struct JsonRpcEndpoint {
+    redacted: String,
+    source: String,
+}
+
+#[derive(Serialize)]
+struct JsonContracts {
+    token_messenger: String,
+    message_transmitter: String,
+    destination_domain: String,
+}
+
+#[derive(Serialize)]
+struct JsonIntentProvenance {
+    route: String,
+    amount: String,
+    recipient: String,
+    source_wallet: JsonSourceWalletProvenance,
+    relay_wallet: String,
+    relay_mode: String,
+    fast_mode: String,
+    max_fee: String,
+    output: String,
+}
+
+#[derive(Serialize)]
+struct JsonSourceWalletProvenance {
+    wallet: String,
+    account: String,
+}
+
+#[derive(Serialize)]
+struct JsonDryRunComplete {
+    status: &'static str,
+    transactions_sent: bool,
+}
+
+#[derive(Serialize)]
+struct JsonWorkflowStart {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct JsonBridgeOutcome {
+    status: &'static str,
+    source_sender: String,
+    recipient: String,
+    token_messenger: String,
+    destination_domain: String,
+    approval: JsonApprovalOutcome,
+    burn: JsonTransactionStatus,
+    attestation: JsonAttestationOutcome,
+    completion: JsonCompletionOutcome,
+    transactions: JsonTransactions,
+}
+
+#[derive(Serialize)]
+struct JsonApprovalOutcome {
+    status: &'static str,
+    tx_hash: Option<String>,
+    allowance_atomic: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonTransactionStatus {
+    status: &'static str,
+    tx_hash: String,
+}
+
+#[derive(Serialize)]
+struct JsonAttestationOutcome {
+    status: &'static str,
+    canonical_message_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct JsonCompletionOutcome {
+    status: &'static str,
+    tx_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonTransactions {
+    approval: Option<String>,
+    burn: String,
+    mint: Option<String>,
+}
+
+fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
+    JsonBridgeIntent {
+        route: JsonRoute {
+            label: intent.route.to_string(),
+            source: JsonChain {
+                cli: intent.route.from().to_string(),
+                label: intent.route.source_label(),
+                chain_id: intent.route.source_chain_id(),
+            },
+            destination: JsonChain {
+                cli: intent.route.to().to_string(),
+                label: intent.route.destination_label(),
+                chain_id: intent.route.destination_chain_id(),
+            },
+        },
+        signer: json_wallet_account(&intent.source_account),
+        relay_signer: intent.relay_account.as_ref().map(json_wallet_account),
+        recipient: intent.recipient.to_string(),
+        usdc: intent.usdc.to_string(),
+        amount: json_usdc_amount(intent.amount),
+        mode: json_transfer_mode(&intent.transfer),
+        relay_policy: JsonRelayPolicy {
+            mode: intent.relay.to_string(),
+            source: intent.provenance.relay_mode.to_string(),
+            relay_signer_required: intent.relay == RelayMode::SelfRelay,
+            destination_provider: if intent.relay == RelayMode::SelfRelay {
+                "self-relay signer"
+            } else {
+                "read-only"
+            },
+            relay_wallet: intent.provenance.relay_wallet.to_string(),
+        },
+        provider_checks: JsonProviderChecks {
+            source: json_provider_check(
+                &intent.provider_validation.source,
+                &intent.provenance.rpc.source,
+            ),
+            destination: json_provider_check(
+                &intent.provider_validation.destination,
+                &intent.provenance.rpc.destination,
+            ),
+        },
+        contracts: JsonContracts {
+            token_messenger: intent.contracts.token_messenger.to_string(),
+            message_transmitter: intent.contracts.message_transmitter.to_string(),
+            destination_domain: intent.contracts.destination_domain.to_string(),
+        },
+        provenance: JsonIntentProvenance {
+            route: intent.provenance.route.to_string(),
+            amount: intent.provenance.amount.to_string(),
+            recipient: intent.provenance.recipient.to_string(),
+            source_wallet: JsonSourceWalletProvenance {
+                wallet: intent.provenance.source_wallet.wallet.to_string(),
+                account: intent.provenance.source_wallet.account.to_string(),
+            },
+            relay_wallet: intent.provenance.relay_wallet.to_string(),
+            relay_mode: intent.provenance.relay_mode.to_string(),
+            fast_mode: intent.provenance.fast_mode.to_string(),
+            max_fee: intent.provenance.max_fee.to_string(),
+            output: intent.provenance.output.to_string(),
+        },
+    }
+}
+
+fn json_wallet_account(account: &WalletAccount) -> JsonWalletAccount {
+    JsonWalletAccount {
+        role: account.role.to_string(),
+        wallet: account.wallet.to_string(),
+        derivation_path: account.derivation_path.to_string(),
+        chain: JsonAccountChain {
+            label: account.chain_label,
+            chain_id: account.chain_id,
+        },
+        address: account.address.to_string(),
+    }
+}
+
+fn json_provider_check(
+    check: &ProviderChainCheck,
+    endpoint: &RpcEndpointProvenance,
+) -> JsonProviderCheck {
+    JsonProviderCheck {
+        role: check.role.report_label(),
+        chain_label: check.chain_label,
+        expected_chain_id: check.expected_chain_id,
+        actual_chain_id: check.actual_chain_id,
+        endpoint: JsonRpcEndpoint {
+            redacted: endpoint.redacted_endpoint.clone(),
+            source: endpoint.source.to_string(),
+        },
+    }
+}
+
+fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
+    JsonTransferMode {
+        mode: mode_label(&transfer.mode),
+        fast_fee: match transfer.fee {
+            TransferFeeResolution::Standard => None,
+            TransferFeeResolution::Fast(fee) => Some(JsonFastFee {
+                live_fee_bps: fee.live_fee.minimum_fee.to_string(),
+                live_fee_amount: json_atomic_usdc_amount(fee.live_fee_amount),
+                max_fee: json_atomic_usdc_amount(fee.max_fee),
+                cap_source: match fee.cap_source {
+                    FastFeeCapSource::LiveBuffered { buffer_percent } => {
+                        format!("live fee + {buffer_percent}% buffer")
+                    }
+                    FastFeeCapSource::Manual => "manual cap".to_owned(),
+                },
+            }),
+        },
+    }
+}
+
+fn json_usdc_amount(amount: UsdcAmount) -> JsonAmount {
+    JsonAmount {
+        usdc: amount.to_string(),
+        atomic: amount.atomic().to_string(),
+    }
+}
+
+fn json_atomic_usdc_amount(atomic: U256) -> JsonAmount {
+    json_usdc_amount(UsdcAmount::from_atomic(atomic))
+}
+
+fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
+    let approval_tx = match outcome.approval {
+        ApprovalOutcome::Skipped { .. } => None,
+        ApprovalOutcome::Sent { tx_hash } => Some(tx_hash.to_string()),
+    };
+    let mint_tx = match outcome.completion {
+        CompletionOutcome::RelayerCompleted | CompletionOutcome::SelfRelayAlreadyCompleted => None,
+        CompletionOutcome::SelfRelayMinted { tx_hash } => Some(tx_hash.to_string()),
+    };
+
+    JsonBridgeOutcome {
+        status: "complete",
+        source_sender: outcome.source_sender.to_string(),
+        recipient: outcome.recipient.to_string(),
+        token_messenger: outcome.token_messenger.to_string(),
+        destination_domain: outcome.destination_domain.to_string(),
+        approval: match outcome.approval {
+            ApprovalOutcome::Skipped { allowance } => JsonApprovalOutcome {
+                status: "skipped_existing_allowance",
+                tx_hash: None,
+                allowance_atomic: Some(allowance.to_string()),
+            },
+            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome {
+                status: "confirmed",
+                tx_hash: Some(tx_hash.to_string()),
+                allowance_atomic: None,
+            },
+        },
+        burn: JsonTransactionStatus {
+            status: "confirmed",
+            tx_hash: outcome.burn_tx.to_string(),
+        },
+        attestation: JsonAttestationOutcome {
+            status: "ready",
+            canonical_message_bytes: outcome.attestation.message_len,
+        },
+        completion: match outcome.completion {
+            CompletionOutcome::RelayerCompleted => JsonCompletionOutcome {
+                status: "relayer_completed",
+                tx_hash: None,
+            },
+            CompletionOutcome::SelfRelayMinted { tx_hash } => JsonCompletionOutcome {
+                status: "self_relay_minted",
+                tx_hash: Some(tx_hash.to_string()),
+            },
+            CompletionOutcome::SelfRelayAlreadyCompleted => JsonCompletionOutcome {
+                status: "self_relay_already_completed",
+                tx_hash: None,
+            },
+        },
+        transactions: JsonTransactions {
+            approval: approval_tx,
+            burn: outcome.burn_tx.to_string(),
+            mint: mint_tx,
+        },
+    }
+}
+
 async fn wait_for_receipt<P>(
     provider: &P,
     tx_hash: TxHash,
@@ -2610,6 +3150,7 @@ mod tests {
             receive_interval_secs: None,
             dry_run: None,
             yes: false,
+            output: None,
         }
     }
 
@@ -2662,6 +3203,7 @@ mod tests {
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.confirmation, ConfirmationPolicy::RequireInteractive);
+        assert_eq!(config.output, OutputMode::Human);
         assert_eq!(
             config.provenance.route,
             RouteConfigProvenance {
@@ -2701,6 +3243,10 @@ mod tests {
             ConfigValueSource::Default("standard finality")
         );
         assert_eq!(config.provenance.max_fee, MaxFeeProvenance::NotApplicable);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::Default("human")
+        );
     }
 
     #[test]
@@ -3369,6 +3915,62 @@ dry_run = true
     }
 
     #[test]
+    fn config_service_resolves_output_mode_from_cli_and_file() {
+        let mut args = sample_args();
+        args.output = Some(OutputMode::Json);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Json);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::CliFlag("--output")
+        );
+
+        let path = write_config(
+            r#"
+amount = "1"
+ethereum_rpc = "https://file.ethereum.example"
+hyperevm_rpc = "https://file.hyperevm.example"
+output = "json"
+"#,
+        );
+        let mut args = empty_args();
+        args.config = Some(path);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Json);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::ConfigFile("output")
+        );
+    }
+
+    #[test]
+    fn config_service_cli_output_mode_overrides_file() {
+        let path = write_config(
+            r#"
+amount = "1"
+ethereum_rpc = "https://file.ethereum.example"
+hyperevm_rpc = "https://file.hyperevm.example"
+output = "json"
+"#,
+        );
+        let mut args = empty_args();
+        args.config = Some(path);
+        args.output = Some(OutputMode::Human);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Human);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::CliFlag("--output")
+        );
+    }
+
+    #[test]
     fn config_service_uses_env_rpc_over_file() {
         let path = write_config(
             r#"
@@ -3623,6 +4225,134 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[test]
+    fn json_reporter_emits_machine_readable_intent_and_outcome_events() {
+        let mut args = sample_args();
+        args.self_relay = Some(true);
+        args.relay_trezor_account = Some(2);
+        args.output = Some(OutputMode::Json);
+        let config = empty_service().bridge_config(args).expect("valid config");
+        let source_account = config.source_wallet.account_info(
+            WalletRole::SourceBurn,
+            config.route.source_label(),
+            config.route.source_chain_id(),
+            source_sender(),
+        );
+        let relay_account = config
+            .relay_wallet
+            .wallet()
+            .expect("self-relay config resolves relay wallet")
+            .account_info(
+                WalletRole::DestinationRelay,
+                config.route.destination_label(),
+                config.route.destination_chain_id(),
+                address!("0000000000000000000000000000000000000004"),
+            );
+        let provider_validation = ProviderValidation::new(
+            config.route,
+            config.route.source_chain_id(),
+            config.route.destination_chain_id(),
+        )
+        .expect("chain IDs match");
+        let contracts = mock_contracts();
+        let intent = BridgeIntent::new(
+            &config,
+            source_account,
+            recipient(),
+            Some(relay_account),
+            provider_validation,
+            contracts,
+            ResolvedTransferMode::standard(),
+        );
+        let outcome = BridgeOutcome {
+            source_sender: source_sender(),
+            recipient: recipient(),
+            token_messenger: contracts.token_messenger,
+            destination_domain: contracts.destination_domain,
+            approval: ApprovalOutcome::Sent {
+                tx_hash: tx_hash(0x11),
+            },
+            burn_tx: tx_hash(0x22),
+            attestation: AttestationOutcome {
+                message_len: MOCK_MESSAGE.len(),
+            },
+            completion: CompletionOutcome::SelfRelayMinted {
+                tx_hash: tx_hash(0x33),
+            },
+        };
+        let lines = SharedJsonLines::default();
+        let reporter = JsonReporter::new(lines.clone());
+
+        reporter
+            .report_intent(&intent)
+            .expect("intent JSON event serializes");
+        reporter
+            .report_workflow_start()
+            .expect("workflow JSON event serializes");
+        reporter
+            .report_outcome(&outcome)
+            .expect("outcome JSON event serializes");
+
+        let events = lines.json_values();
+        let source_address = source_sender().to_string();
+        let recipient_address = recipient().to_string();
+        let approval_tx = tx_hash(0x11).to_string();
+        let burn_tx = tx_hash(0x22).to_string();
+        let mint_tx = tx_hash(0x33).to_string();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"].as_str(), Some("bridge_intent"));
+        assert_eq!(
+            events[0]["data"]["route"]["source"]["cli"].as_str(),
+            Some("ethereum")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["cli"].as_str(),
+            Some("hyperevm")
+        );
+        assert_eq!(
+            events[0]["data"]["signer"]["address"].as_str(),
+            Some(source_address.as_str())
+        );
+        assert_eq!(
+            events[0]["data"]["recipient"].as_str(),
+            Some(recipient_address.as_str())
+        );
+        assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
+        assert_eq!(events[0]["data"]["mode"]["mode"].as_str(), Some("standard"));
+        assert_eq!(
+            events[0]["data"]["relay_policy"]["relay_signer_required"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            events[0]["data"]["provenance"]["output"].as_str(),
+            Some("CLI flag --output")
+        );
+        assert_eq!(events[1]["event"].as_str(), Some("workflow_start"));
+        assert_eq!(events[2]["event"].as_str(), Some("bridge_outcome"));
+        assert_eq!(events[2]["data"]["status"].as_str(), Some("complete"));
+        assert_eq!(
+            events[2]["data"]["approval"]["status"].as_str(),
+            Some("confirmed")
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["approval"].as_str(),
+            Some(approval_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["burn"].as_str(),
+            Some(burn_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["mint"].as_str(),
+            Some(mint_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["completion"]["status"].as_str(),
+            Some("self_relay_minted")
+        );
+    }
+
+    #[test]
     fn confirmation_input_requires_exact_confirm_token() {
         validate_confirmation_input("CONFIRM\n").expect("CONFIRM is accepted");
 
@@ -3744,6 +4474,34 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
         fn entries(&self) -> Vec<&'static str> {
             self.0.borrow().clone()
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct SharedJsonLines(Rc<RefCell<Vec<String>>>);
+
+    impl SharedJsonLines {
+        fn json_values(&self) -> Vec<serde_json::Value> {
+            self.0
+                .borrow()
+                .iter()
+                .map(|line| {
+                    serde_json::from_str(line)
+                        .expect("JSON reporter should emit one valid JSON object per line")
+                })
+                .collect()
+        }
+    }
+
+    impl JsonReportSink for SharedJsonLines {
+        fn write_json<T>(&self, value: &T) -> Result<()>
+        where
+            T: Serialize,
+        {
+            let line =
+                serde_json::to_string(value).wrap_err("failed to serialize JSON test line")?;
+            self.0.borrow_mut().push(line);
+            Ok(())
         }
     }
 
@@ -3921,20 +4679,24 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     impl Reporter for MockReporter {
-        fn report_intent(&self, _intent: &BridgeIntent) {
+        fn report_intent(&self, _intent: &BridgeIntent) -> Result<()> {
             self.calls.push("report_intent");
+            Ok(())
         }
 
-        fn report_dry_run_complete(&self) {
+        fn report_dry_run_complete(&self) -> Result<()> {
             self.calls.push("report_dry_run_complete");
+            Ok(())
         }
 
-        fn report_workflow_start(&self) {
+        fn report_workflow_start(&self) -> Result<()> {
             self.calls.push("report_workflow_start");
+            Ok(())
         }
 
-        fn report_outcome(&self, _outcome: &BridgeOutcome) {
+        fn report_outcome(&self, _outcome: &BridgeOutcome) -> Result<()> {
             self.calls.push("report_outcome");
+            Ok(())
         }
     }
 

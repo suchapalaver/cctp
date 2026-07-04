@@ -163,6 +163,22 @@ destination MessageTransmitter, and relay policy. A live run requires typing
 without sending transactions, or `--yes` for explicit non-interactive
 automation.
 
+For script or agent consumption, pass `--output json`. JSON mode writes
+newline-delimited reporter events to stdout and keeps confirmation prompts and
+status messages on stderr:
+
+```sh
+cctp bridge \
+  --amount 10.25 \
+  --dry-run \
+  --output json
+```
+
+The JSON stream includes a `bridge_intent` event with the route, signer,
+recipient, amount, transfer mode, relay policy, provider checks, contracts, and
+configuration provenance. Live runs also emit `workflow_start` and
+`bridge_outcome` events with transaction hashes and completion statuses.
+
 The bridge intent also prints provenance for high-impact configuration values,
 including route, amount, recipient, wallet accounts, relay mode, fast mode, fee
 cap, and RPC endpoint roles. RPC endpoints are redacted to scheme, port, and a
@@ -197,6 +213,7 @@ trezor_account = 0
 fast = false
 self_relay = false
 dry_run = false
+output = "human"
 ```
 
 The explicit testnet route uses route-specific RPC fields:
