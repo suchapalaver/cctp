@@ -21,7 +21,7 @@ include = [
 
 [dependencies]
 alloy = { version = "2.0.5", features = ["signer-trezor"] }
-alloy-chains = "0.2"
+alloy-chains = { version = "0.2", features = ["serde"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 cctp-rs = "7"

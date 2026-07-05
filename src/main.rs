@@ -1299,11 +1299,11 @@ impl RouteConfig {
     }
 
     fn source_chain_id(&self) -> u64 {
-        u64::from(self.route.source_chain())
+        u64::from(self.source_chain())
     }
 
     fn destination_chain_id(&self) -> u64 {
-        u64::from(self.route.destination_chain())
+        u64::from(self.destination_chain())
     }
 
     const fn cctp_route(&self) -> CctpV2Route {
@@ -1316,6 +1316,14 @@ impl RouteConfig {
 
     const fn to(&self) -> ChainArg {
         self.to
+    }
+
+    const fn source_chain(&self) -> NamedChain {
+        self.from.named_chain()
+    }
+
+    const fn destination_chain(&self) -> NamedChain {
+        self.to.named_chain()
     }
 
     const fn source_label(&self) -> &'static str {
@@ -1894,8 +1902,14 @@ struct WalletAccount {
     wallet: WalletConfig,
     derivation_path: WalletDerivationPath,
     chain_label: &'static str,
-    chain_id: u64,
+    chain: NamedChain,
     address: Address,
+}
+
+impl WalletAccount {
+    fn chain_id(&self) -> u64 {
+        u64::from(self.chain)
+    }
 }
 
 impl WalletConfig {
@@ -1915,7 +1929,7 @@ impl WalletConfig {
         self,
         role: WalletRole,
         chain_label: &'static str,
-        chain_id: u64,
+        chain: NamedChain,
         address: Address,
     ) -> WalletAccount {
         WalletAccount {
@@ -1923,7 +1937,7 @@ impl WalletConfig {
             wallet: self,
             derivation_path: self.derivation_path(),
             chain_label,
-            chain_id,
+            chain,
             address,
         }
     }
@@ -2061,7 +2075,7 @@ impl WalletService for TrezorWalletService {
         let account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
-            config.route.source_chain_id(),
+            config.route.source_chain(),
             address,
         );
 
@@ -2094,7 +2108,7 @@ impl WalletService for TrezorWalletService {
         let account = wallet.account_info(
             WalletRole::DestinationRelay,
             config.route.destination_label(),
-            config.route.destination_chain_id(),
+            config.route.destination_chain(),
             address,
         );
 
@@ -2258,14 +2272,14 @@ impl ProviderValidation {
                 route,
                 ProviderEndpointRole::Source,
                 route.source_label(),
-                route.source_chain_id(),
+                route.source_chain(),
                 source_actual_chain_id,
             )?,
             destination: ProviderChainCheck::validate(
                 route,
                 ProviderEndpointRole::Destination,
                 route.destination_label(),
-                route.destination_chain_id(),
+                route.destination_chain(),
                 destination_actual_chain_id,
             )?,
         })
@@ -2276,7 +2290,7 @@ impl ProviderValidation {
 struct ProviderChainCheck {
     role: ProviderEndpointRole,
     chain_label: &'static str,
-    expected_chain_id: u64,
+    expected_chain: NamedChain,
     actual_chain_id: u64,
 }
 
@@ -2285,9 +2299,10 @@ impl ProviderChainCheck {
         route: RouteConfig,
         role: ProviderEndpointRole,
         chain_label: &'static str,
-        expected_chain_id: u64,
+        expected_chain: NamedChain,
         actual_chain_id: u64,
     ) -> Result<Self> {
+        let expected_chain_id = u64::from(expected_chain);
         if actual_chain_id != expected_chain_id {
             bail!(
                 "{} chain ID mismatch for route {route}: expected {expected_chain_id} ({chain_label}), got {actual_chain_id}",
@@ -2298,9 +2313,13 @@ impl ProviderChainCheck {
         Ok(Self {
             role,
             chain_label,
-            expected_chain_id,
+            expected_chain,
             actual_chain_id,
         })
+    }
+
+    fn expected_chain_id(&self) -> u64 {
+        u64::from(self.expected_chain)
     }
 }
 
@@ -2534,7 +2553,8 @@ impl HumanReporter {
         println!("{label} derivation: {}", account.derivation_path);
         println!(
             "{label} chain: {} (chain id {})",
-            account.chain_label, account.chain_id
+            account.chain_label,
+            account.chain_id()
         );
         println!("{label} address: {}", account.address);
     }
@@ -2701,8 +2721,8 @@ struct JsonBridgeIntent {
     route: JsonRoute,
     signer: JsonWalletAccount,
     relay_signer: Option<JsonWalletAccount>,
-    recipient: String,
-    usdc: String,
+    recipient: Address,
+    usdc: Address,
     amount: JsonAmount,
     mode: JsonTransferMode,
     relay_policy: JsonRelayPolicy,
@@ -2721,6 +2741,7 @@ struct JsonRoute {
 #[derive(Serialize)]
 struct JsonChain {
     cli: String,
+    chain: NamedChain,
     label: &'static str,
     chain_id: u64,
 }
@@ -2731,11 +2752,12 @@ struct JsonWalletAccount {
     wallet: String,
     derivation_path: String,
     chain: JsonAccountChain,
-    address: String,
+    address: Address,
 }
 
 #[derive(Serialize)]
 struct JsonAccountChain {
+    chain: NamedChain,
     label: &'static str,
     chain_id: u64,
 }
@@ -2780,6 +2802,7 @@ struct JsonProviderChecks {
 struct JsonProviderCheck {
     role: &'static str,
     chain_label: &'static str,
+    expected_chain: NamedChain,
     expected_chain_id: u64,
     actual_chain_id: u64,
     endpoint: JsonRpcEndpoint,
@@ -2793,8 +2816,8 @@ struct JsonRpcEndpoint {
 
 #[derive(Serialize)]
 struct JsonContracts {
-    token_messenger: String,
-    message_transmitter: String,
+    token_messenger: Address,
+    message_transmitter: Address,
     destination_domain: String,
 }
 
@@ -2831,9 +2854,9 @@ struct JsonWorkflowStart {
 #[derive(Serialize)]
 struct JsonBridgeOutcome {
     status: &'static str,
-    source_sender: String,
-    recipient: String,
-    token_messenger: String,
+    source_sender: Address,
+    recipient: Address,
+    token_messenger: Address,
     destination_domain: String,
     approval: JsonApprovalOutcome,
     burn: JsonTransactionStatus,
@@ -2846,13 +2869,13 @@ struct JsonBridgeOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum JsonApprovalOutcome {
     SkippedExistingAllowance { allowance_atomic: String },
-    Confirmed { tx_hash: String },
+    Confirmed { tx_hash: TxHash },
 }
 
 #[derive(Serialize)]
 struct JsonTransactionStatus {
     status: &'static str,
-    tx_hash: String,
+    tx_hash: TxHash,
 }
 
 #[derive(Serialize)]
@@ -2865,15 +2888,15 @@ struct JsonAttestationOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum JsonCompletionOutcome {
     RelayerCompleted,
-    SelfRelayMinted { tx_hash: String },
+    SelfRelayMinted { tx_hash: TxHash },
     SelfRelayAlreadyCompleted,
 }
 
 #[derive(Serialize)]
 struct JsonTransactions {
-    approval: Option<String>,
-    burn: String,
-    mint: Option<String>,
+    approval: Option<TxHash>,
+    burn: TxHash,
+    mint: Option<TxHash>,
 }
 
 fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
@@ -2882,19 +2905,21 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
             label: intent.route.to_string(),
             source: JsonChain {
                 cli: intent.route.from().to_string(),
+                chain: intent.route.source_chain(),
                 label: intent.route.source_label(),
                 chain_id: intent.route.source_chain_id(),
             },
             destination: JsonChain {
                 cli: intent.route.to().to_string(),
+                chain: intent.route.destination_chain(),
                 label: intent.route.destination_label(),
                 chain_id: intent.route.destination_chain_id(),
             },
         },
         signer: json_wallet_account(&intent.source_account),
         relay_signer: intent.relay_account.as_ref().map(json_wallet_account),
-        recipient: intent.recipient.to_string(),
-        usdc: intent.usdc.to_string(),
+        recipient: intent.recipient,
+        usdc: intent.usdc,
         amount: json_usdc_amount(intent.amount),
         mode: json_transfer_mode(&intent.transfer),
         relay_policy: JsonRelayPolicy {
@@ -2919,8 +2944,8 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
             ),
         },
         contracts: JsonContracts {
-            token_messenger: intent.contracts.token_messenger.to_string(),
-            message_transmitter: intent.contracts.message_transmitter.to_string(),
+            token_messenger: intent.contracts.token_messenger,
+            message_transmitter: intent.contracts.message_transmitter,
             destination_domain: intent.contracts.destination_domain.to_string(),
         },
         provenance: JsonIntentProvenance {
@@ -2947,9 +2972,10 @@ fn json_wallet_account(account: &WalletAccount) -> JsonWalletAccount {
         derivation_path: account.derivation_path.to_string(),
         chain: JsonAccountChain {
             label: account.chain_label,
-            chain_id: account.chain_id,
+            chain: account.chain,
+            chain_id: account.chain_id(),
         },
-        address: account.address.to_string(),
+        address: account.address,
     }
 }
 
@@ -2960,7 +2986,8 @@ fn json_provider_check(
     JsonProviderCheck {
         role: check.role.report_label(),
         chain_label: check.chain_label,
-        expected_chain_id: check.expected_chain_id,
+        expected_chain: check.expected_chain,
+        expected_chain_id: check.expected_chain_id(),
         actual_chain_id: check.actual_chain_id,
         endpoint: JsonRpcEndpoint {
             redacted: endpoint.redacted_endpoint.clone(),
@@ -3002,18 +3029,18 @@ fn json_atomic_usdc_amount(atomic: U256) -> JsonAmount {
 fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
     let approval_tx = match outcome.approval {
         ApprovalOutcome::Skipped { .. } => None,
-        ApprovalOutcome::Sent { tx_hash } => Some(tx_hash.to_string()),
+        ApprovalOutcome::Sent { tx_hash } => Some(tx_hash),
     };
     let mint_tx = match outcome.completion {
         CompletionOutcome::RelayerCompleted | CompletionOutcome::SelfRelayAlreadyCompleted => None,
-        CompletionOutcome::SelfRelayMinted { tx_hash } => Some(tx_hash.to_string()),
+        CompletionOutcome::SelfRelayMinted { tx_hash } => Some(tx_hash),
     };
 
     JsonBridgeOutcome {
         status: "complete",
-        source_sender: outcome.source_sender.to_string(),
-        recipient: outcome.recipient.to_string(),
-        token_messenger: outcome.token_messenger.to_string(),
+        source_sender: outcome.source_sender,
+        recipient: outcome.recipient,
+        token_messenger: outcome.token_messenger,
         destination_domain: outcome.destination_domain.to_string(),
         approval: match outcome.approval {
             ApprovalOutcome::Skipped { allowance } => {
@@ -3021,13 +3048,11 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
                     allowance_atomic: allowance.to_string(),
                 }
             }
-            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed {
-                tx_hash: tx_hash.to_string(),
-            },
+            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed { tx_hash },
         },
         burn: JsonTransactionStatus {
             status: "confirmed",
-            tx_hash: outcome.burn_tx.to_string(),
+            tx_hash: outcome.burn_tx,
         },
         attestation: JsonAttestationOutcome {
             status: "ready",
@@ -3036,9 +3061,7 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
         completion: match outcome.completion {
             CompletionOutcome::RelayerCompleted => JsonCompletionOutcome::RelayerCompleted,
             CompletionOutcome::SelfRelayMinted { tx_hash } => {
-                JsonCompletionOutcome::SelfRelayMinted {
-                    tx_hash: tx_hash.to_string(),
-                }
+                JsonCompletionOutcome::SelfRelayMinted { tx_hash }
             }
             CompletionOutcome::SelfRelayAlreadyCompleted => {
                 JsonCompletionOutcome::SelfRelayAlreadyCompleted
@@ -3046,7 +3069,7 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
         },
         transactions: JsonTransactions {
             approval: approval_tx,
-            burn: outcome.burn_tx.to_string(),
+            burn: outcome.burn_tx,
             mint: mint_tx,
         },
     }
@@ -3688,7 +3711,12 @@ mod tests {
         let wallet = WalletConfig::Trezor { account: 3 };
         let address = address!("0000000000000000000000000000000000000003");
 
-        let account = wallet.account_info(WalletRole::SourceBurn, "Ethereum mainnet", 1, address);
+        let account = wallet.account_info(
+            WalletRole::SourceBurn,
+            "Ethereum mainnet",
+            NamedChain::Mainnet,
+            address,
+        );
 
         wallet.validate().expect("wallet config is valid");
         assert_eq!(account.role, WalletRole::SourceBurn);
@@ -3699,7 +3727,8 @@ mod tests {
         );
         assert_eq!(account.derivation_path.to_string(), "m/44'/60'/3'/0/0");
         assert_eq!(account.chain_label, "Ethereum mainnet");
-        assert_eq!(account.chain_id, 1);
+        assert_eq!(account.chain, NamedChain::Mainnet);
+        assert_eq!(account.chain_id(), 1);
         assert_eq!(account.address, address);
     }
 
@@ -4045,7 +4074,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
                 chain_label: "Ethereum mainnet",
-                expected_chain_id: route.source_chain_id(),
+                expected_chain: NamedChain::Mainnet,
                 actual_chain_id: route.source_chain_id()
             }
         );
@@ -4054,7 +4083,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
                 chain_label: "HyperEVM",
-                expected_chain_id: route.destination_chain_id(),
+                expected_chain: NamedChain::Hyperliquid,
                 actual_chain_id: route.destination_chain_id()
             }
         );
@@ -4073,7 +4102,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
                 chain_label: "Ethereum Sepolia testnet",
-                expected_chain_id: 11_155_111,
+                expected_chain: NamedChain::Sepolia,
                 actual_chain_id: 11_155_111
             }
         );
@@ -4082,7 +4111,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
                 chain_label: "Base Sepolia testnet",
-                expected_chain_id: 84_532,
+                expected_chain: NamedChain::BaseSepolia,
                 actual_chain_id: 84_532
             }
         );
@@ -4166,7 +4195,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         let source_account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
-            config.route.source_chain_id(),
+            config.route.source_chain(),
             source_sender(),
         );
         let relay_account = config
@@ -4176,7 +4205,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             .account_info(
                 WalletRole::DestinationRelay,
                 config.route.destination_label(),
-                config.route.destination_chain_id(),
+                config.route.destination_chain(),
                 address!("0000000000000000000000000000000000000004"),
             );
         let provider_validation = ProviderValidation::new(
@@ -4226,7 +4255,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         let source_account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
-            config.route.source_chain_id(),
+            config.route.source_chain(),
             source_sender(),
         );
         let relay_account = config
@@ -4236,7 +4265,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             .account_info(
                 WalletRole::DestinationRelay,
                 config.route.destination_label(),
-                config.route.destination_chain_id(),
+                config.route.destination_chain(),
                 address!("0000000000000000000000000000000000000004"),
             );
         let provider_validation = ProviderValidation::new(
@@ -4298,16 +4327,32 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some("ethereum")
         );
         assert_eq!(
+            events[0]["data"]["route"]["source"]["chain"].as_str(),
+            Some("mainnet")
+        );
+        assert_eq!(
             events[0]["data"]["route"]["destination"]["cli"].as_str(),
             Some("hyperevm")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["chain"].as_str(),
+            Some("hyperliquid")
         );
         assert_eq!(
             events[0]["data"]["signer"]["address"].as_str(),
             Some(source_address.as_str())
         );
         assert_eq!(
+            events[0]["data"]["signer"]["chain"]["chain"].as_str(),
+            Some("mainnet")
+        );
+        assert_eq!(
             events[0]["data"]["recipient"].as_str(),
             Some(recipient_address.as_str())
+        );
+        assert_eq!(
+            events[0]["data"]["provider_checks"]["source"]["expected_chain"].as_str(),
+            Some("mainnet")
         );
         assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
         assert_eq!(events[0]["data"]["mode"]["mode"].as_str(), Some("standard"));
@@ -4517,7 +4562,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                 account: config.source_wallet.account_info(
                     WalletRole::SourceBurn,
                     config.route.source_label(),
-                    config.route.source_chain_id(),
+                    config.route.source_chain(),
                     source_sender(),
                 ),
             })
@@ -4537,7 +4582,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                 account: wallet.account_info(
                     WalletRole::DestinationRelay,
                     config.route.destination_label(),
-                    config.route.destination_chain_id(),
+                    config.route.destination_chain(),
                     address!("0000000000000000000000000000000000000003"),
                 ),
             }))
