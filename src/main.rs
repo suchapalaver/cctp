@@ -2347,10 +2347,6 @@ impl ProviderChainCheck {
             actual_chain_id,
         })
     }
-
-    fn expected_chain_id(&self) -> u64 {
-        self.expected.chain_id()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2760,39 +2756,94 @@ struct JsonBridgeIntent {
     provenance: JsonIntentProvenance,
 }
 
-#[derive(Serialize)]
-struct JsonRoute {
-    #[serde(serialize_with = "serialize_display")]
-    label: RouteConfig,
-    source: JsonChain,
-    destination: JsonChain,
+struct JsonRoute(RouteConfig);
+
+impl Serialize for JsonRoute {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let route = self.0;
+        let mut state = serializer.serialize_struct("JsonRoute", 3)?;
+        state.serialize_field("label", &route.to_string())?;
+        state.serialize_field(
+            "source",
+            &JsonRouteChain {
+                cli: route.from(),
+                label: route.source_label(),
+            },
+        )?;
+        state.serialize_field(
+            "destination",
+            &JsonRouteChain {
+                cli: route.to(),
+                label: route.destination_label(),
+            },
+        )?;
+        state.end()
+    }
 }
 
-#[derive(Serialize)]
-struct JsonChain {
+struct JsonRouteChain {
     cli: ChainArg,
-    chain: NamedChain,
     label: &'static str,
-    chain_id: u64,
 }
 
-#[derive(Serialize)]
-struct JsonWalletAccount {
-    #[serde(serialize_with = "serialize_display")]
-    role: WalletRole,
-    #[serde(serialize_with = "serialize_display")]
-    wallet: WalletConfig,
-    #[serde(serialize_with = "serialize_display")]
-    derivation_path: WalletDerivationPath,
-    chain: JsonAccountChain,
-    address: Address,
+impl Serialize for JsonRouteChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let chain = self.cli.named_chain();
+        let mut state = serializer.serialize_struct("JsonRouteChain", 4)?;
+        state.serialize_field("cli", &self.cli)?;
+        state.serialize_field("chain", &chain)?;
+        state.serialize_field("label", &self.label)?;
+        state.serialize_field("chain_id", &u64::from(chain))?;
+        state.end()
+    }
 }
 
-#[derive(Serialize)]
-struct JsonAccountChain {
+struct JsonWalletAccount(WalletAccount);
+
+impl Serialize for JsonWalletAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let account = self.0;
+        let mut state = serializer.serialize_struct("JsonWalletAccount", 5)?;
+        state.serialize_field("role", &JsonDisplay(account.role))?;
+        state.serialize_field("wallet", &JsonDisplay(account.wallet))?;
+        state.serialize_field("derivation_path", &JsonDisplay(account.derivation_path))?;
+        state.serialize_field(
+            "chain",
+            &JsonChainIdentity {
+                chain: account.chain,
+                label: account.chain_label,
+            },
+        )?;
+        state.serialize_field("address", &account.address)?;
+        state.end()
+    }
+}
+
+struct JsonChainIdentity {
     chain: NamedChain,
     label: &'static str,
-    chain_id: u64,
+}
+
+impl Serialize for JsonChainIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JsonChainIdentity", 3)?;
+        state.serialize_field("chain", &self.chain)?;
+        state.serialize_field("label", &self.label)?;
+        state.serialize_field("chain_id", &u64::from(self.chain))?;
+        state.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -2853,16 +2904,9 @@ struct JsonProviderChecks {
 #[derive(Serialize)]
 struct JsonProviderCheck {
     role: &'static str,
-    expected: JsonExpectedProviderChain,
+    expected: JsonChainIdentity,
     actual_chain_id: u64,
     endpoint: JsonRpcEndpoint,
-}
-
-#[derive(Serialize)]
-struct JsonExpectedProviderChain {
-    chain: NamedChain,
-    label: &'static str,
-    chain_id: u64,
 }
 
 #[derive(Serialize)]
@@ -2993,23 +3037,23 @@ where
     serializer.serialize_str(&value.to_string())
 }
 
+struct JsonDisplay<T>(T);
+
+impl<T> Serialize for JsonDisplay<T>
+where
+    T: std::fmt::Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
 fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
     JsonBridgeIntent {
-        route: JsonRoute {
-            label: intent.route,
-            source: JsonChain {
-                cli: intent.route.from(),
-                chain: intent.route.source_chain(),
-                label: intent.route.source_label(),
-                chain_id: intent.route.source_chain_id(),
-            },
-            destination: JsonChain {
-                cli: intent.route.to(),
-                chain: intent.route.destination_chain(),
-                label: intent.route.destination_label(),
-                chain_id: intent.route.destination_chain_id(),
-            },
-        },
+        route: JsonRoute(intent.route),
         signer: json_wallet_account(&intent.source_account),
         relay_signer: intent.relay_account.as_ref().map(json_wallet_account),
         recipient: intent.recipient,
@@ -3055,17 +3099,7 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
 }
 
 fn json_wallet_account(account: &WalletAccount) -> JsonWalletAccount {
-    JsonWalletAccount {
-        role: account.role,
-        wallet: account.wallet,
-        derivation_path: account.derivation_path,
-        chain: JsonAccountChain {
-            label: account.chain_label,
-            chain: account.chain,
-            chain_id: account.chain_id(),
-        },
-        address: account.address,
-    }
+    JsonWalletAccount(*account)
 }
 
 fn json_provider_check(
@@ -3074,10 +3108,9 @@ fn json_provider_check(
 ) -> JsonProviderCheck {
     JsonProviderCheck {
         role: check.role.report_label(),
-        expected: JsonExpectedProviderChain {
+        expected: JsonChainIdentity {
             chain: check.expected.chain,
             label: check.expected.label,
-            chain_id: check.expected_chain_id(),
         },
         actual_chain_id: check.actual_chain_id,
         endpoint: JsonRpcEndpoint {
@@ -4423,12 +4456,20 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some("mainnet")
         );
         assert_eq!(
+            events[0]["data"]["route"]["source"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
             events[0]["data"]["route"]["destination"]["cli"].as_str(),
             Some("hyperevm")
         );
         assert_eq!(
             events[0]["data"]["route"]["destination"]["chain"].as_str(),
             Some("hyperliquid")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["chain_id"].as_u64(),
+            Some(999)
         );
         assert_eq!(
             events[0]["data"]["signer"]["address"].as_str(),
@@ -4439,12 +4480,24 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some("mainnet")
         );
         assert_eq!(
+            events[0]["data"]["signer"]["chain"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
             events[0]["data"]["recipient"].as_str(),
             Some(recipient_address.as_str())
         );
         assert_eq!(
             events[0]["data"]["provider_checks"]["source"]["expected"]["chain"].as_str(),
             Some("mainnet")
+        );
+        assert_eq!(
+            events[0]["data"]["provider_checks"]["source"]["expected"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            events[0]["data"]["contracts"]["destination_domain"]["domain_id"].as_u64(),
+            Some(19)
         );
         assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
         assert_eq!(
@@ -4467,6 +4520,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
         assert_eq!(events[1]["event"].as_str(), Some("workflow_start"));
         assert_eq!(events[2]["event"].as_str(), Some("bridge_outcome"));
         assert_eq!(events[2]["data"]["status"].as_str(), Some("complete"));
+        assert_eq!(
+            events[2]["data"]["destination_domain"]["domain_id"].as_u64(),
+            Some(19)
+        );
         assert_eq!(
             events[2]["data"]["approval"]["status"].as_str(),
             Some("confirmed")
