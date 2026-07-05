@@ -13,12 +13,12 @@ use alloy::{
 use alloy_chains::NamedChain;
 use async_trait::async_trait;
 use cctp_rs::{
-    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, MintResult, PollingConfig, TransferFee,
-    TransferMode, UsdcAmount,
+    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, FeeBps, MintResult, PollingConfig,
+    TransferFee, TransferMode, UsdcAmount,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -160,7 +160,7 @@ struct BridgeArgs {
     output: Option<OutputMode>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ChainArg {
     #[value(name = "ethereum")]
@@ -368,7 +368,7 @@ where
         );
         self.reporter.report_intent(&intent)?;
 
-        if config.dry_run {
+        if config.run_mode.is_dry_run() {
             self.reporter.report_dry_run_complete()?;
             return Ok(BridgeRunResult::DryRun);
         }
@@ -516,7 +516,7 @@ where
                 "max_fee_usdc",
             )
         };
-        let dry_run = args.dry_run.or(file.dry_run).unwrap_or(false);
+        let run_mode = BridgeRunMode::from_dry_run(args.dry_run.or(file.dry_run).unwrap_or(false));
         let output = sourced_cli_file_default(
             args.output,
             "--output",
@@ -529,11 +529,12 @@ where
             args.receive_attempts.or(file.receive_attempts),
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
+        let relay = RelayMode::from_self_relay(self_relay.value);
 
         let source_wallet = WalletConfig::from_kind(wallet.value, trezor_account.value);
         source_wallet.validate()?;
         let relay_wallet = RelayWalletConfig::new(
-            self_relay.value,
+            relay,
             wallet.value,
             relay_trezor_account.as_ref().map(|account| account.value),
             trezor_account.value,
@@ -558,7 +559,7 @@ where
                 account: trezor_account.source,
             },
             relay_wallet: RelayWalletProvenance::from_config(
-                self_relay.value,
+                relay,
                 relay_trezor_account.as_ref().map(|account| account.source),
             ),
             recipient: RecipientProvenance::from_source(
@@ -582,9 +583,9 @@ where
             recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
             usdc: args.usdc.or(file.usdc).unwrap_or(route.default_usdc()),
             transfer,
-            relay: RelayMode::from_self_relay(self_relay.value),
+            relay,
             receive_polling,
-            dry_run,
+            run_mode,
             confirmation: ConfirmationPolicy::from_yes(args.yes),
             output: output.value,
             provenance,
@@ -831,14 +832,13 @@ enum RelayWalletProvenance {
 }
 
 impl RelayWalletProvenance {
-    const fn from_config(self_relay: bool, relay_account: Option<ConfigValueSource>) -> Self {
-        if !self_relay {
-            return Self::NotUsed;
-        }
-
-        match relay_account {
-            Some(account) => Self::ExplicitAccount { account },
-            None => Self::DefaultedToSourceAccount,
+    const fn from_config(mode: RelayMode, relay_account: Option<ConfigValueSource>) -> Self {
+        match mode {
+            RelayMode::WaitForRelayer => Self::NotUsed,
+            RelayMode::SelfRelay => match relay_account {
+                Some(account) => Self::ExplicitAccount { account },
+                None => Self::DefaultedToSourceAccount,
+            },
         }
     }
 }
@@ -915,6 +915,23 @@ fn max_fee_provenance(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BridgeRunMode {
+    Execute,
+    DryRun,
+}
+
+impl BridgeRunMode {
+    const fn from_dry_run(dry_run: bool) -> Self {
+        if dry_run { Self::DryRun } else { Self::Execute }
+    }
+
+    const fn is_dry_run(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BridgeConfig {
     route: RouteConfig,
@@ -927,7 +944,7 @@ struct BridgeConfig {
     transfer: TransferRequest,
     relay: RelayMode,
     receive_polling: ReceivePolling,
-    dry_run: bool,
+    run_mode: BridgeRunMode,
     confirmation: ConfirmationPolicy,
     output: OutputMode,
     provenance: BridgeConfigProvenance,
@@ -1603,7 +1620,8 @@ impl From<Option<Address>> for RecipientConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum RelayMode {
     WaitForRelayer,
     SelfRelay,
@@ -1763,7 +1781,8 @@ struct FastTransferFeeResolution {
     cap_source: FastFeeCapSource,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
 enum FastFeeCapSource {
     LiveBuffered { buffer_percent: u32 },
     Manual,
@@ -1984,20 +2003,19 @@ enum RelayWalletConfig {
 
 impl RelayWalletConfig {
     const fn new(
-        self_relay: bool,
+        mode: RelayMode,
         kind: WalletKind,
         relay_trezor_account: Option<u32>,
         source_trezor_account: u32,
     ) -> Self {
-        if !self_relay {
-            return Self::None;
-        }
-
-        match kind {
-            WalletKind::Trezor => Self::Trezor {
-                account: match relay_trezor_account {
-                    Some(account) => account,
-                    None => source_trezor_account,
+        match mode {
+            RelayMode::WaitForRelayer => Self::None,
+            RelayMode::SelfRelay => match kind {
+                WalletKind::Trezor => Self::Trezor {
+                    account: match relay_trezor_account {
+                        Some(account) => account,
+                        None => source_trezor_account,
+                    },
                 },
             },
         }
@@ -2677,8 +2695,7 @@ where
 
     fn report_dry_run_complete(&self) -> Result<()> {
         self.report_event(JsonReportEvent::DryRunComplete(JsonDryRunComplete {
-            status: "complete",
-            transactions_sent: false,
+            run_mode: BridgeRunMode::DryRun,
         }))
     }
 
@@ -2745,14 +2762,15 @@ struct JsonBridgeIntent {
 
 #[derive(Serialize)]
 struct JsonRoute {
-    label: String,
+    #[serde(serialize_with = "serialize_display")]
+    label: RouteConfig,
     source: JsonChain,
     destination: JsonChain,
 }
 
 #[derive(Serialize)]
 struct JsonChain {
-    cli: String,
+    cli: ChainArg,
     chain: NamedChain,
     label: &'static str,
     chain_id: u64,
@@ -2760,9 +2778,12 @@ struct JsonChain {
 
 #[derive(Serialize)]
 struct JsonWalletAccount {
-    role: String,
-    wallet: String,
-    derivation_path: String,
+    #[serde(serialize_with = "serialize_display")]
+    role: WalletRole,
+    #[serde(serialize_with = "serialize_display")]
+    wallet: WalletConfig,
+    #[serde(serialize_with = "serialize_display")]
+    derivation_path: WalletDerivationPath,
     chain: JsonAccountChain,
     address: Address,
 }
@@ -2776,8 +2797,10 @@ struct JsonAccountChain {
 
 #[derive(Serialize)]
 struct JsonAmount {
-    usdc: String,
-    atomic: String,
+    #[serde(serialize_with = "serialize_display")]
+    usdc: UsdcAmount,
+    #[serde(serialize_with = "serialize_display")]
+    atomic: U256,
 }
 
 #[derive(Serialize)]
@@ -2789,19 +2812,36 @@ enum JsonTransferMode {
 
 #[derive(Serialize)]
 struct JsonFastFee {
-    live_fee_bps: String,
+    live_fee_bps: FeeBps,
     live_fee_amount: JsonAmount,
     max_fee: JsonAmount,
-    cap_source: String,
+    cap_source: FastFeeCapSource,
 }
 
 #[derive(Serialize)]
 struct JsonRelayPolicy {
-    mode: String,
-    source: String,
-    relay_signer_required: bool,
-    destination_provider: &'static str,
-    relay_wallet: String,
+    mode: RelayMode,
+    #[serde(serialize_with = "serialize_display")]
+    source: ConfigValueSource,
+    destination_provider: JsonDestinationProvider,
+    #[serde(serialize_with = "serialize_display")]
+    relay_wallet: RelayWalletProvenance,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonDestinationProvider {
+    ReadOnly,
+    SelfRelaySigner,
+}
+
+impl JsonDestinationProvider {
+    const fn from_relay_mode(mode: RelayMode) -> Self {
+        match mode {
+            RelayMode::WaitForRelayer => Self::ReadOnly,
+            RelayMode::SelfRelay => Self::SelfRelaySigner,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2828,39 +2868,55 @@ struct JsonExpectedProviderChain {
 #[derive(Serialize)]
 struct JsonRpcEndpoint {
     redacted: String,
-    source: String,
+    #[serde(serialize_with = "serialize_display")]
+    source: ConfigValueSource,
 }
 
 #[derive(Serialize)]
 struct JsonContracts {
     token_messenger: Address,
     message_transmitter: Address,
-    destination_domain: String,
+    destination_domain: JsonCctpDomain,
+}
+
+#[derive(Serialize)]
+struct JsonCctpDomain {
+    domain: DomainId,
+    domain_id: u32,
 }
 
 #[derive(Serialize)]
 struct JsonIntentProvenance {
-    route: String,
-    amount: String,
-    recipient: String,
+    #[serde(serialize_with = "serialize_display")]
+    route: RouteConfigProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    amount: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    recipient: RecipientProvenance,
     source_wallet: JsonSourceWalletProvenance,
-    relay_wallet: String,
-    relay_mode: String,
-    fast_mode: String,
-    max_fee: String,
-    output: String,
+    #[serde(serialize_with = "serialize_display")]
+    relay_wallet: RelayWalletProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    relay_mode: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    fast_mode: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    max_fee: MaxFeeProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    output: ConfigValueSource,
 }
 
 #[derive(Serialize)]
 struct JsonSourceWalletProvenance {
-    wallet: String,
-    account: String,
+    #[serde(serialize_with = "serialize_display")]
+    wallet: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    account: ConfigValueSource,
 }
 
 #[derive(Serialize)]
 struct JsonDryRunComplete {
-    status: &'static str,
-    transactions_sent: bool,
+    run_mode: BridgeRunMode,
 }
 
 #[derive(Serialize)]
@@ -2874,7 +2930,7 @@ struct JsonBridgeOutcome {
     source_sender: Address,
     recipient: Address,
     token_messenger: Address,
-    destination_domain: String,
+    destination_domain: JsonCctpDomain,
     approval: JsonApprovalOutcome,
     burn: JsonTransactionStatus,
     attestation: JsonAttestationOutcome,
@@ -2885,8 +2941,13 @@ struct JsonBridgeOutcome {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum JsonApprovalOutcome {
-    SkippedExistingAllowance { allowance_atomic: String },
-    Confirmed { tx_hash: TxHash },
+    SkippedExistingAllowance {
+        #[serde(serialize_with = "serialize_display")]
+        allowance_atomic: U256,
+    },
+    Confirmed {
+        tx_hash: TxHash,
+    },
 }
 
 #[derive(Serialize)]
@@ -2916,18 +2977,26 @@ struct JsonTransactions {
     mint: Option<TxHash>,
 }
 
+fn serialize_display<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: std::fmt::Display,
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
 fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
     JsonBridgeIntent {
         route: JsonRoute {
-            label: intent.route.to_string(),
+            label: intent.route,
             source: JsonChain {
-                cli: intent.route.from().to_string(),
+                cli: intent.route.from(),
                 chain: intent.route.source_chain(),
                 label: intent.route.source_label(),
                 chain_id: intent.route.source_chain_id(),
             },
             destination: JsonChain {
-                cli: intent.route.to().to_string(),
+                cli: intent.route.to(),
                 chain: intent.route.destination_chain(),
                 label: intent.route.destination_label(),
                 chain_id: intent.route.destination_chain_id(),
@@ -2940,15 +3009,10 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
         amount: json_usdc_amount(intent.amount),
         mode: json_transfer_mode(&intent.transfer),
         relay_policy: JsonRelayPolicy {
-            mode: intent.relay.to_string(),
-            source: intent.provenance.relay_mode.to_string(),
-            relay_signer_required: intent.relay == RelayMode::SelfRelay,
-            destination_provider: if intent.relay == RelayMode::SelfRelay {
-                "self-relay signer"
-            } else {
-                "read-only"
-            },
-            relay_wallet: intent.provenance.relay_wallet.to_string(),
+            mode: intent.relay,
+            source: intent.provenance.relay_mode,
+            destination_provider: JsonDestinationProvider::from_relay_mode(intent.relay),
+            relay_wallet: intent.provenance.relay_wallet,
         },
         provider_checks: JsonProviderChecks {
             source: json_provider_check(
@@ -2963,30 +3027,30 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
         contracts: JsonContracts {
             token_messenger: intent.contracts.token_messenger,
             message_transmitter: intent.contracts.message_transmitter,
-            destination_domain: intent.contracts.destination_domain.to_string(),
+            destination_domain: json_cctp_domain(intent.contracts.destination_domain),
         },
         provenance: JsonIntentProvenance {
-            route: intent.provenance.route.to_string(),
-            amount: intent.provenance.amount.to_string(),
-            recipient: intent.provenance.recipient.to_string(),
+            route: intent.provenance.route,
+            amount: intent.provenance.amount,
+            recipient: intent.provenance.recipient,
             source_wallet: JsonSourceWalletProvenance {
-                wallet: intent.provenance.source_wallet.wallet.to_string(),
-                account: intent.provenance.source_wallet.account.to_string(),
+                wallet: intent.provenance.source_wallet.wallet,
+                account: intent.provenance.source_wallet.account,
             },
-            relay_wallet: intent.provenance.relay_wallet.to_string(),
-            relay_mode: intent.provenance.relay_mode.to_string(),
-            fast_mode: intent.provenance.fast_mode.to_string(),
-            max_fee: intent.provenance.max_fee.to_string(),
-            output: intent.provenance.output.to_string(),
+            relay_wallet: intent.provenance.relay_wallet,
+            relay_mode: intent.provenance.relay_mode,
+            fast_mode: intent.provenance.fast_mode,
+            max_fee: intent.provenance.max_fee,
+            output: intent.provenance.output,
         },
     }
 }
 
 fn json_wallet_account(account: &WalletAccount) -> JsonWalletAccount {
     JsonWalletAccount {
-        role: account.role.to_string(),
-        wallet: account.wallet.to_string(),
-        derivation_path: account.derivation_path.to_string(),
+        role: account.role,
+        wallet: account.wallet,
+        derivation_path: account.derivation_path,
         chain: JsonAccountChain {
             label: account.chain_label,
             chain: account.chain,
@@ -3010,7 +3074,7 @@ fn json_provider_check(
         actual_chain_id: check.actual_chain_id,
         endpoint: JsonRpcEndpoint {
             redacted: endpoint.redacted_endpoint.clone(),
-            source: endpoint.source.to_string(),
+            source: endpoint.source,
         },
     }
 }
@@ -3020,24 +3084,26 @@ fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
         TransferFeeResolution::Standard => JsonTransferMode::Standard,
         TransferFeeResolution::Fast(fee) => JsonTransferMode::Fast {
             fast_fee: JsonFastFee {
-                live_fee_bps: fee.live_fee.minimum_fee.to_string(),
+                live_fee_bps: fee.live_fee.minimum_fee,
                 live_fee_amount: json_atomic_usdc_amount(fee.live_fee_amount),
                 max_fee: json_atomic_usdc_amount(fee.max_fee),
-                cap_source: match fee.cap_source {
-                    FastFeeCapSource::LiveBuffered { buffer_percent } => {
-                        format!("live fee + {buffer_percent}% buffer")
-                    }
-                    FastFeeCapSource::Manual => "manual cap".to_owned(),
-                },
+                cap_source: fee.cap_source,
             },
         },
     }
 }
 
+fn json_cctp_domain(domain: DomainId) -> JsonCctpDomain {
+    JsonCctpDomain {
+        domain,
+        domain_id: domain.as_u32(),
+    }
+}
+
 fn json_usdc_amount(amount: UsdcAmount) -> JsonAmount {
     JsonAmount {
-        usdc: amount.to_string(),
-        atomic: amount.atomic().to_string(),
+        usdc: amount,
+        atomic: amount.atomic(),
     }
 }
 
@@ -3060,11 +3126,11 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
         source_sender: outcome.source_sender,
         recipient: outcome.recipient,
         token_messenger: outcome.token_messenger,
-        destination_domain: outcome.destination_domain.to_string(),
+        destination_domain: json_cctp_domain(outcome.destination_domain),
         approval: match outcome.approval {
             ApprovalOutcome::Skipped { allowance } => {
                 JsonApprovalOutcome::SkippedExistingAllowance {
-                    allowance_atomic: allowance.to_string(),
+                    allowance_atomic: allowance,
                 }
             }
             ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed { tx_hash },
@@ -3123,7 +3189,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cctp_rs::FeeBps;
     use std::{
         cell::RefCell,
         collections::HashMap,
@@ -3753,7 +3818,8 @@ mod tests {
 
     #[test]
     fn relay_wallet_config_validates_without_device() {
-        let relay_wallet = RelayWalletConfig::new(true, WalletKind::Trezor, Some(2), 0);
+        let relay_wallet =
+            RelayWalletConfig::new(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0);
 
         relay_wallet.validate().expect("relay wallet is valid");
         assert_eq!(
@@ -3882,7 +3948,7 @@ dry_run = true
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 9 });
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
-        assert!(config.dry_run);
+        assert_eq!(config.run_mode, BridgeRunMode::DryRun);
         assert_eq!(
             config.provenance.amount,
             ConfigValueSource::CliFlag("--amount")
@@ -3936,7 +4002,7 @@ dry_run = true
         assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
-        assert!(!config.dry_run);
+        assert_eq!(config.run_mode, BridgeRunMode::Execute);
         assert_eq!(
             config.provenance.fast_mode,
             ConfigValueSource::CliFlag("--fast")
@@ -4376,10 +4442,18 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some("mainnet")
         );
         assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
+        assert_eq!(
+            events[0]["data"]["amount"]["atomic"].as_str(),
+            Some("1250000")
+        );
         assert_eq!(events[0]["data"]["mode"]["mode"].as_str(), Some("standard"));
         assert_eq!(
-            events[0]["data"]["relay_policy"]["relay_signer_required"].as_bool(),
-            Some(true)
+            events[0]["data"]["relay_policy"]["mode"].as_str(),
+            Some("self_relay")
+        );
+        assert_eq!(
+            events[0]["data"]["relay_policy"]["destination_provider"].as_str(),
+            Some("self_relay_signer")
         );
         assert_eq!(
             events[0]["data"]["provenance"]["output"].as_str(),
