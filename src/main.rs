@@ -334,9 +334,9 @@ where
         let source_signer = self.wallet_service.source_signer(&config).await?;
         let relay_signer = self.wallet_service.relay_signer(&config).await?;
         let source_account = source_signer.account;
-        let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
+        let relay_account = relay_signer.account;
         let source_signer_address = source_account.address;
-        let relay = ResolvedRelay::from_config(config.relay, relay_account)?;
+        let relay = ResolvedRelay::from_config(config.relay, relay_account);
         let workflow_relay = relay.workflow_relay();
         let recipient = config.recipient.resolve(source_signer_address);
 
@@ -538,7 +538,7 @@ where
             wallet.value,
             relay_trezor_account.as_ref().map(|account| account.value),
             trezor_account.value,
-        )?;
+        );
         relay.validate()?;
         let rpc = RpcEndpoints::from_resolved(&resolved_rpc);
         let transfer = transfer_request(fast.value, max_fee_usdc.as_ref())?;
@@ -556,7 +556,6 @@ where
                 account: trezor_account.source,
             },
             relay_wallet: RelayWalletProvenance::from_config(
-                relay_mode,
                 relay_trezor_account.as_ref().map(|account| account.source),
             ),
             recipient: RecipientProvenance::from_source(
@@ -819,19 +818,15 @@ struct SourceWalletProvenance {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelayWalletProvenance {
-    NotUsed,
     ExplicitAccount { account: ConfigValueSource },
     DefaultedToSourceAccount,
 }
 
 impl RelayWalletProvenance {
-    const fn from_config(mode: RelayMode, relay_account: Option<ConfigValueSource>) -> Self {
-        match mode {
-            RelayMode::WaitForRelayer => Self::NotUsed,
-            RelayMode::SelfRelay => match relay_account {
-                Some(account) => Self::ExplicitAccount { account },
-                None => Self::DefaultedToSourceAccount,
-            },
+    const fn from_config(relay_account: Option<ConfigValueSource>) -> Self {
+        match relay_account {
+            Some(account) => Self::ExplicitAccount { account },
+            None => Self::DefaultedToSourceAccount,
         }
     }
 }
@@ -839,7 +834,6 @@ impl RelayWalletProvenance {
 impl std::fmt::Display for RelayWalletProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotUsed => f.write_str("not used"),
             Self::ExplicitAccount { account } => write!(f, "account from {account}"),
             Self::DefaultedToSourceAccount => f.write_str("defaulted to source account"),
         }
@@ -992,11 +986,13 @@ enum CompletionOutcome {
     RelayerCompleted,
     SelfRelayMinted { tx_hash: TxHash },
     SelfRelayAlreadyCompleted,
+    FallbackSelfRelayMinted { tx_hash: TxHash },
+    FallbackSelfRelayAlreadyCompleted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkflowRelay {
-    WaitForRelayer,
+    WaitForRelayer { fallback: WorkflowRelayFallback },
     SelfRelay { submitter: Address },
 }
 
@@ -1069,16 +1065,45 @@ where
         };
 
         let completion = match self.config.relay {
-            WorkflowRelay::WaitForRelayer => {
-                self.runtime
+            WorkflowRelay::WaitForRelayer { fallback } => {
+                match self
+                    .runtime
                     .wait_for_receive(
                         &message,
                         self.config.receive_polling.attempts,
                         self.config.receive_polling.interval_secs,
                     )
                     .await
-                    .wrap_err("timed out waiting for destination receive status")?;
-                CompletionOutcome::RelayerCompleted
+                {
+                    Ok(()) => CompletionOutcome::RelayerCompleted,
+                    Err(wait_error) => {
+                        let submitter = fallback.submitter();
+                        match self
+                            .runtime
+                            .mint_if_needed(message, attestation, submitter)
+                            .await
+                            .wrap_err_with(|| {
+                                format!(
+                                    "permissionless relayer did not complete before fallback and fallback self-relay failed: {wait_error}"
+                                )
+                            })? {
+                            MintResult::Minted(tx_hash) => {
+                                self.runtime
+                                    .wait_destination_receipt(
+                                        tx_hash,
+                                        "mint",
+                                        120,
+                                        Duration::from_secs(2),
+                                    )
+                                    .await?;
+                                CompletionOutcome::FallbackSelfRelayMinted { tx_hash }
+                            }
+                            MintResult::AlreadyRelayed => {
+                                CompletionOutcome::FallbackSelfRelayAlreadyCompleted
+                            }
+                        }
+                    }
+                }
             }
             WorkflowRelay::SelfRelay { submitter } => {
                 match self
@@ -1989,48 +2014,107 @@ impl std::fmt::Display for WalletConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelayConfig {
-    WaitForRelayer,
+    WaitForRelayer { fallback: RelayFallbackConfig },
+    SelfRelay { wallet: WalletConfig },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayFallbackConfig {
     SelfRelay { wallet: WalletConfig },
 }
 
 impl RelayConfig {
-    fn from_mode(
+    const fn from_mode(
         mode: RelayMode,
         kind: WalletKind,
         relay_trezor_account: Option<u32>,
         source_trezor_account: u32,
-    ) -> Result<Self> {
+    ) -> Self {
+        let wallet = relay_wallet_config(kind, relay_trezor_account, source_trezor_account);
         match mode {
-            RelayMode::WaitForRelayer => {
-                if relay_trezor_account.is_some() {
-                    bail!("relay_trezor_account is only valid when self_relay is true");
-                }
-                Ok(Self::WaitForRelayer)
-            }
-            RelayMode::SelfRelay => Ok(match kind {
-                WalletKind::Trezor => Self::SelfRelay {
-                    wallet: WalletConfig::Trezor {
-                        account: match relay_trezor_account {
-                            Some(account) => account,
-                            None => source_trezor_account,
-                        },
-                    },
-                },
-            }),
+            RelayMode::WaitForRelayer => Self::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { wallet },
+            },
+            RelayMode::SelfRelay => Self::SelfRelay { wallet },
         }
     }
 
-    const fn wallet(self) -> Option<WalletConfig> {
+    const fn wallet(self) -> WalletConfig {
         match self {
-            Self::WaitForRelayer => None,
-            Self::SelfRelay { wallet } => Some(wallet),
+            Self::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { wallet },
+            }
+            | Self::SelfRelay { wallet } => wallet,
         }
     }
 
     fn validate(self) -> Result<()> {
+        self.wallet().validate()
+    }
+}
+
+const fn relay_wallet_config(
+    kind: WalletKind,
+    relay_trezor_account: Option<u32>,
+    source_trezor_account: u32,
+) -> WalletConfig {
+    match kind {
+        WalletKind::Trezor => WalletConfig::Trezor {
+            account: match relay_trezor_account {
+                Some(account) => account,
+                None => source_trezor_account,
+            },
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedRelayFallback {
+    SelfRelay { account: WalletAccount },
+}
+
+impl ResolvedRelayFallback {
+    const fn account(self) -> WalletAccount {
         match self {
-            Self::WaitForRelayer => Ok(()),
-            Self::SelfRelay { wallet } => wallet.validate(),
+            Self::SelfRelay { account } => account,
+        }
+    }
+
+    const fn workflow(self) -> WorkflowRelayFallback {
+        match self {
+            Self::SelfRelay { account } => WorkflowRelayFallback::SelfRelay {
+                submitter: account.address,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowRelayFallback {
+    SelfRelay { submitter: Address },
+}
+
+impl WorkflowRelayFallback {
+    const fn submitter(self) -> Address {
+        match self {
+            Self::SelfRelay { submitter } => submitter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayPolicyLabel {
+    WaitThenSelfRelay,
+    SelfRelay,
+}
+
+impl std::fmt::Display for RelayPolicyLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WaitThenSelfRelay => {
+                f.write_str("wait for any permissionless relayer, then self-relay fallback")
+            }
+            Self::SelfRelay => f.write_str("self-relay on destination chain"),
         }
     }
 }
@@ -2061,7 +2145,7 @@ trait WalletService {
     async fn relay_signer(
         &self,
         config: &BridgeConfig,
-    ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>>;
+    ) -> Result<RelaySignerRuntime<Self::RelaySigner>>;
 }
 
 #[async_trait(?Send)]
@@ -2102,10 +2186,8 @@ impl WalletService for TrezorWalletService {
     async fn relay_signer(
         &self,
         config: &BridgeConfig,
-    ) -> Result<Option<RelaySignerRuntime<TrezorSigner>>> {
-        let Some(wallet) = config.relay.wallet() else {
-            return Ok(None);
-        };
+    ) -> Result<RelaySignerRuntime<TrezorSigner>> {
+        let wallet = config.relay.wallet();
 
         let signer = wallet
             .trezor_signer(config.route.destination_chain_id())
@@ -2129,7 +2211,7 @@ impl WalletService for TrezorWalletService {
             address,
         );
 
-        Ok(Some(RelaySignerRuntime { signer, account }))
+        Ok(RelaySignerRuntime { signer, account })
     }
 }
 
@@ -2156,7 +2238,7 @@ where
         &self,
         config: &BridgeConfig,
         source_signer: W::SourceSigner,
-        relay_signer: Option<RelaySignerRuntime<W::RelaySigner>>,
+        relay_signer: RelaySignerRuntime<W::RelaySigner>,
     ) -> Self::Providers;
 
     fn bridge(
@@ -2192,21 +2274,16 @@ impl ProviderService<TrezorWalletService> for AlloyProviderService {
         &self,
         config: &BridgeConfig,
         source_signer: TrezorSigner,
-        relay_signer: Option<RelaySignerRuntime<TrezorSigner>>,
+        relay_signer: RelaySignerRuntime<TrezorSigner>,
     ) -> BridgeProviders {
         let source = ProviderBuilder::new()
             .wallet(source_signer)
             .connect_http(config.rpc.source.clone())
             .erased();
-        let destination = match relay_signer {
-            Some(runtime) => ProviderBuilder::new()
-                .wallet(runtime.signer)
-                .connect_http(config.rpc.destination.clone())
-                .erased(),
-            None => ProviderBuilder::new()
-                .connect_http(config.rpc.destination.clone())
-                .erased(),
-        };
+        let destination = ProviderBuilder::new()
+            .wallet(relay_signer.signer)
+            .connect_http(config.rpc.destination.clone())
+            .erased();
 
         BridgeProviders {
             source,
@@ -2392,41 +2469,48 @@ impl BridgeContracts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolvedRelay {
-    WaitForRelayer,
+    WaitForRelayer { fallback: ResolvedRelayFallback },
     SelfRelay { account: WalletAccount },
 }
 
 impl ResolvedRelay {
-    fn from_config(config: RelayConfig, account: Option<WalletAccount>) -> Result<Self> {
-        match (config, account) {
-            (RelayConfig::WaitForRelayer, None) => Ok(Self::WaitForRelayer),
-            (RelayConfig::WaitForRelayer, Some(_)) => {
-                bail!("wait-for-relayer workflow must not have a destination relay account")
-            }
-            (RelayConfig::SelfRelay { .. }, Some(account)) => Ok(Self::SelfRelay { account }),
-            (RelayConfig::SelfRelay { .. }, None) => {
-                bail!("self-relay workflow requires a destination relay account")
-            }
+    const fn from_config(config: RelayConfig, account: WalletAccount) -> Self {
+        match config {
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { .. },
+            } => Self::WaitForRelayer {
+                fallback: ResolvedRelayFallback::SelfRelay { account },
+            },
+            RelayConfig::SelfRelay { .. } => Self::SelfRelay { account },
         }
     }
 
     const fn mode(self) -> RelayMode {
         match self {
-            Self::WaitForRelayer => RelayMode::WaitForRelayer,
+            Self::WaitForRelayer { .. } => RelayMode::WaitForRelayer,
             Self::SelfRelay { .. } => RelayMode::SelfRelay,
         }
     }
 
-    const fn account(self) -> Option<WalletAccount> {
+    const fn label(self) -> RelayPolicyLabel {
         match self {
-            Self::WaitForRelayer => None,
-            Self::SelfRelay { account } => Some(account),
+            Self::WaitForRelayer { .. } => RelayPolicyLabel::WaitThenSelfRelay,
+            Self::SelfRelay { .. } => RelayPolicyLabel::SelfRelay,
+        }
+    }
+
+    const fn account(self) -> WalletAccount {
+        match self {
+            Self::WaitForRelayer { fallback } => fallback.account(),
+            Self::SelfRelay { account } => account,
         }
     }
 
     const fn workflow_relay(self) -> WorkflowRelay {
         match self {
-            Self::WaitForRelayer => WorkflowRelay::WaitForRelayer,
+            Self::WaitForRelayer { fallback } => WorkflowRelay::WaitForRelayer {
+                fallback: fallback.workflow(),
+            },
             Self::SelfRelay { account } => WorkflowRelay::SelfRelay {
                 submitter: account.address,
             },
@@ -2583,7 +2667,7 @@ impl HumanReporter {
         println!("Fee cap source: {}", intent.provenance.max_fee);
         println!(
             "Relay: {} ({})",
-            intent.relay.mode(),
+            intent.relay.label(),
             intent.provenance.relay_mode
         );
         match intent.relay {
@@ -2591,7 +2675,11 @@ impl HumanReporter {
                 self.report_wallet_account("Relay", &account);
                 println!("Relay wallet source: {}", intent.provenance.relay_wallet);
             }
-            ResolvedRelay::WaitForRelayer => println!("Destination provider: read-only"),
+            ResolvedRelay::WaitForRelayer { fallback } => {
+                println!("Relay fallback: self-relay if the relayer wait expires");
+                self.report_wallet_account("Relay fallback", &fallback.account());
+                println!("Relay wallet source: {}", intent.provenance.relay_wallet);
+            }
         }
         println!(
             "TokenMessengerV2 approval spender: {}",
@@ -2696,6 +2784,14 @@ impl HumanReporter {
             CompletionOutcome::SelfRelayAlreadyCompleted => {
                 println!("Transfer was already completed by a relayer.");
             }
+            CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => {
+                println!("Relayer wait expired; fallback mint tx: {tx_hash}");
+            }
+            CompletionOutcome::FallbackSelfRelayAlreadyCompleted => {
+                println!(
+                    "Relayer wait expired; transfer was already completed before fallback mint."
+                );
+            }
         }
         println!("Transfer complete.");
     }
@@ -2787,7 +2883,7 @@ enum JsonReportEvent {
 struct JsonBridgeIntent {
     route: JsonRoute,
     signer: JsonWalletAccount,
-    relay_signer: Option<JsonWalletAccount>,
+    relay_signer: JsonWalletAccount,
     recipient: Address,
     usdc: Address,
     amount: JsonAmount,
@@ -2915,8 +3011,11 @@ struct JsonFastFee {
 struct JsonRelayPolicy {
     mode: RelayMode,
     #[serde(serialize_with = "serialize_display")]
+    policy: RelayPolicyLabel,
+    #[serde(serialize_with = "serialize_display")]
     source: ConfigValueSource,
     destination_provider: JsonDestinationProvider,
+    fallback: Option<JsonRelayFallbackPolicy>,
     #[serde(serialize_with = "serialize_display")]
     relay_wallet: RelayWalletProvenance,
 }
@@ -2924,17 +3023,13 @@ struct JsonRelayPolicy {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum JsonDestinationProvider {
-    ReadOnly,
     SelfRelaySigner,
 }
 
-impl JsonDestinationProvider {
-    const fn from_relay_mode(mode: RelayMode) -> Self {
-        match mode {
-            RelayMode::WaitForRelayer => Self::ReadOnly,
-            RelayMode::SelfRelay => Self::SelfRelaySigner,
-        }
-    }
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonRelayFallbackPolicy {
+    SelfRelaySigner,
 }
 
 #[derive(Serialize)]
@@ -3086,6 +3181,8 @@ enum JsonCompletionOutcome {
     RelayerCompleted,
     SelfRelayMinted { tx_hash: TxHash },
     SelfRelayAlreadyCompleted,
+    FallbackSelfRelayMinted { tx_hash: TxHash },
+    FallbackSelfRelayAlreadyCompleted,
 }
 
 #[derive(Serialize)]
@@ -3118,21 +3215,26 @@ where
 }
 
 fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
+    let relay_account = intent.relay.account();
     JsonBridgeIntent {
         route: JsonRoute(intent.route),
         signer: json_wallet_account(&intent.source_account),
-        relay_signer: intent
-            .relay
-            .account()
-            .map(|account| json_wallet_account(&account)),
+        relay_signer: json_wallet_account(&relay_account),
         recipient: intent.recipient,
         usdc: intent.usdc,
         amount: json_usdc_amount(intent.amount),
         mode: json_transfer_mode(&intent.transfer),
         relay_policy: JsonRelayPolicy {
             mode: intent.relay.mode(),
+            policy: intent.relay.label(),
             source: intent.provenance.relay_mode,
-            destination_provider: JsonDestinationProvider::from_relay_mode(intent.relay.mode()),
+            destination_provider: JsonDestinationProvider::SelfRelaySigner,
+            fallback: match intent.relay {
+                ResolvedRelay::WaitForRelayer { .. } => {
+                    Some(JsonRelayFallbackPolicy::SelfRelaySigner)
+                }
+                ResolvedRelay::SelfRelay { .. } => None,
+            },
             relay_wallet: intent.provenance.relay_wallet,
         },
         provider_checks: JsonProviderChecks {
@@ -3224,8 +3326,11 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
         ApprovalOutcome::Sent { tx_hash } => Some(tx_hash),
     };
     let mint_tx = match outcome.completion {
-        CompletionOutcome::RelayerCompleted | CompletionOutcome::SelfRelayAlreadyCompleted => None,
-        CompletionOutcome::SelfRelayMinted { tx_hash } => Some(tx_hash),
+        CompletionOutcome::RelayerCompleted
+        | CompletionOutcome::SelfRelayAlreadyCompleted
+        | CompletionOutcome::FallbackSelfRelayAlreadyCompleted => None,
+        CompletionOutcome::SelfRelayMinted { tx_hash }
+        | CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => Some(tx_hash),
     };
 
     JsonBridgeOutcome {
@@ -3257,6 +3362,12 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
             }
             CompletionOutcome::SelfRelayAlreadyCompleted => {
                 JsonCompletionOutcome::SelfRelayAlreadyCompleted
+            }
+            CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => {
+                JsonCompletionOutcome::FallbackSelfRelayMinted { tx_hash }
+            }
+            CompletionOutcome::FallbackSelfRelayAlreadyCompleted => {
+                JsonCompletionOutcome::FallbackSelfRelayAlreadyCompleted
             }
         },
         transactions: JsonTransactions {
@@ -3403,7 +3514,14 @@ mod tests {
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
-        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 }
+                }
+            }
+        );
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert_eq!(config.transfer, TransferRequest::Standard);
@@ -3441,7 +3559,7 @@ mod tests {
         );
         assert_eq!(
             config.provenance.relay_wallet,
-            RelayWalletProvenance::NotUsed
+            RelayWalletProvenance::DefaultedToSourceAccount
         );
         assert_eq!(
             config.provenance.fast_mode,
@@ -3899,17 +4017,18 @@ mod tests {
     }
 
     #[test]
-    fn config_service_rejects_relay_account_without_self_relay() {
+    fn config_service_uses_relay_account_for_default_fallback() {
         let mut args = sample_args();
         args.relay_trezor_account = Some(2);
 
-        let error = empty_service()
-            .bridge_config(args)
-            .expect_err("relay account without self-relay is invalid");
-
-        assert!(
-            error.to_string().contains("only valid when self_relay"),
-            "unexpected error: {error}"
+        let config = empty_service().bridge_config(args).expect("valid config");
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 2 }
+                }
+            }
         );
     }
 
@@ -3941,15 +4060,15 @@ mod tests {
 
     #[test]
     fn relay_config_validates_without_device() {
-        let relay = RelayConfig::from_mode(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0)
-            .expect("self-relay config resolves");
+        let relay = RelayConfig::from_mode(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0);
 
         relay.validate().expect("relay config is valid");
-        assert_eq!(
-            relay.wallet().expect("relay wallet exists"),
-            WalletConfig::Trezor { account: 2 }
+        assert_eq!(relay.wallet(), WalletConfig::Trezor { account: 2 });
+        assert!(
+            RelayConfig::from_mode(RelayMode::WaitForRelayer, WalletKind::Trezor, None, 0)
+                .validate()
+                .is_ok()
         );
-        assert!(RelayConfig::WaitForRelayer.validate().is_ok());
     }
 
     #[test]
@@ -4070,7 +4189,14 @@ dry_run = true
             "https://env.hyperevm.example/"
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 9 });
-        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 9 }
+                }
+            }
+        );
         assert_eq!(config.run_mode, BridgeRunMode::DryRun);
         assert_eq!(
             config.provenance.amount,
@@ -4123,7 +4249,14 @@ dry_run = true
         let config = empty_service().bridge_config(args).expect("valid config");
 
         assert_eq!(config.transfer, TransferRequest::Standard);
-        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 }
+                }
+            }
+        );
         assert_eq!(config.run_mode, BridgeRunMode::Execute);
         assert_eq!(
             config.provenance.fast_mode,
@@ -4407,7 +4540,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             config.route.source_chain(),
             source_sender(),
         );
-        let relay_account = config.relay.wallet().expect("relay wallet").account_info(
+        let relay_account = config.relay.wallet().account_info(
             WalletRole::DestinationRelay,
             config.route.destination_label(),
             config.route.destination_chain(),
@@ -4469,16 +4602,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
             config.route.source_chain(),
             source_sender(),
         );
-        let relay_account = config
-            .relay
-            .wallet()
-            .expect("self-relay config resolves relay wallet")
-            .account_info(
-                WalletRole::DestinationRelay,
-                config.route.destination_label(),
-                config.route.destination_chain(),
-                address!("0000000000000000000000000000000000000004"),
-            );
+        let relay_account = config.relay.wallet().account_info(
+            WalletRole::DestinationRelay,
+            config.route.destination_label(),
+            config.route.destination_chain(),
+            address!("0000000000000000000000000000000000000004"),
+        );
         let provider_validation = ProviderValidation::new(
             config.route,
             config.route.source_chain_id(),
@@ -4598,9 +4727,14 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some("self_relay")
         );
         assert_eq!(
+            events[0]["data"]["relay_policy"]["policy"].as_str(),
+            Some("self-relay on destination chain")
+        );
+        assert_eq!(
             events[0]["data"]["relay_policy"]["destination_provider"].as_str(),
             Some("self_relay_signer")
         );
+        assert!(events[0]["data"]["relay_policy"]["fallback"].is_null());
         assert_eq!(
             events[0]["data"]["provenance"]["output"].as_str(),
             Some("CLI flag --output")
@@ -4816,13 +4950,11 @@ hyperevm_rpc = "https://file.hyperevm.example"
         async fn relay_signer(
             &self,
             config: &BridgeConfig,
-        ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>> {
+        ) -> Result<RelaySignerRuntime<Self::RelaySigner>> {
             self.calls.push("relay_signer");
-            let Some(wallet) = config.relay.wallet() else {
-                return Ok(None);
-            };
+            let wallet = config.relay.wallet();
 
-            Ok(Some(RelaySignerRuntime {
+            Ok(RelaySignerRuntime {
                 signer: MockSigner,
                 account: wallet.account_info(
                     WalletRole::DestinationRelay,
@@ -4830,7 +4962,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                     config.route.destination_chain(),
                     address!("0000000000000000000000000000000000000003"),
                 ),
-            }))
+            })
         }
     }
 
@@ -4859,7 +4991,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             &self,
             _config: &BridgeConfig,
             _source_signer: MockSigner,
-            _relay_signer: Option<RelaySignerRuntime<MockSigner>>,
+            _relay_signer: RelaySignerRuntime<MockSigner>,
         ) -> Self::Providers {
             self.calls.push("bridge_providers");
             MockProviders
@@ -5064,13 +5196,21 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[tokio::test]
-    async fn workflow_waits_for_relayer_without_destination_submitter() {
+    async fn workflow_prefers_relayer_before_fallback() {
         let allowance = U256::from(2_000_000u64);
+        let relay_submitter = address!("0000000000000000000000000000000000000003");
         let runtime = MockBridgeRuntime {
             allowance,
             ..Default::default()
         };
-        let mut workflow = mock_workflow(WorkflowRelay::WaitForRelayer, runtime);
+        let mut workflow = mock_workflow(
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: relay_submitter,
+                },
+            },
+            runtime,
+        );
 
         let outcome = workflow.run().await.expect("workflow succeeds");
 
@@ -5094,6 +5234,46 @@ hyperevm_rpc = "https://file.hyperevm.example"
             ]
         );
         assert_eq!(workflow.runtime.last_mint_from, None);
+    }
+
+    #[tokio::test]
+    async fn workflow_falls_back_to_self_relay_when_relayer_wait_expires() {
+        let relay_submitter = address!("0000000000000000000000000000000000000003");
+        let runtime = MockBridgeRuntime {
+            receive_completes: false,
+            mint_result: MintResult::Minted(tx_hash(0x33)),
+            ..Default::default()
+        };
+        let mut workflow = mock_workflow(
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: relay_submitter,
+                },
+            },
+            runtime,
+        );
+
+        let outcome = workflow.run().await.expect("workflow succeeds");
+
+        assert_eq!(
+            outcome.completion,
+            CompletionOutcome::FallbackSelfRelayMinted {
+                tx_hash: tx_hash(0x33)
+            }
+        );
+        assert_eq!(
+            workflow.runtime.calls,
+            vec![
+                "get_allowance",
+                "burn",
+                "wait_source_receipt",
+                "get_attestation",
+                "wait_for_receive",
+                "mint_if_needed",
+                "wait_destination_receipt"
+            ]
+        );
+        assert_eq!(workflow.runtime.last_mint_from, Some(relay_submitter));
     }
 
     #[tokio::test]
@@ -5142,18 +5322,29 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[test]
-    fn resolved_relay_rejects_self_relay_without_relay_account() {
-        let error = ResolvedRelay::from_config(
-            RelayConfig::SelfRelay {
-                wallet: WalletConfig::Trezor { account: 0 },
+    fn resolved_relay_uses_fallback_account_for_wait_mode() {
+        let account = WalletConfig::Trezor { account: 0 }.account_info(
+            WalletRole::DestinationRelay,
+            "HyperEVM",
+            NamedChain::Hyperliquid,
+            address!("0000000000000000000000000000000000000003"),
+        );
+        let relay = ResolvedRelay::from_config(
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 },
+                },
             },
-            None,
-        )
-        .expect_err("self-relay without relay account is invalid");
+            account,
+        );
 
-        assert!(
-            error.to_string().contains("destination relay account"),
-            "unexpected error: {error}"
+        assert_eq!(
+            relay.workflow_relay(),
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: account.address
+                }
+            }
         );
     }
 
@@ -5211,6 +5402,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         message: Vec<u8>,
         attestation: AttestationBytes,
         mint_result: MintResult,
+        receive_completes: bool,
         calls: Vec<&'static str>,
         last_mint_from: Option<Address>,
     }
@@ -5224,6 +5416,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                 message: MOCK_MESSAGE.to_vec(),
                 attestation: vec![0xdd],
                 mint_result: MintResult::AlreadyRelayed,
+                receive_completes: true,
                 calls: Vec::new(),
                 last_mint_from: None,
             }
@@ -5281,7 +5474,11 @@ hyperevm_rpc = "https://file.hyperevm.example"
             _poll_interval: Option<u64>,
         ) -> Result<()> {
             self.calls.push("wait_for_receive");
-            Ok(())
+            if self.receive_completes {
+                Ok(())
+            } else {
+                bail!("destination receive status was not observed")
+            }
         }
 
         async fn mint_if_needed(

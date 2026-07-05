@@ -7,7 +7,8 @@ The default supported production route is Ethereum mainnet to HyperEVM. The CLI
 also has an explicit Ethereum Sepolia to Base Sepolia testnet route for dry-run
 and test-funds validation before operational use. The CLI uses Alloy's Trezor
 signer support and defaults to waiting for any permissionless relayer to complete
-the destination mint.
+the destination mint, with a Trezor-backed self-relay fallback if the relayer
+wait expires.
 
 ## Install
 
@@ -90,8 +91,10 @@ cctp bridge \
 The testnet route defaults to Circle's Ethereum Sepolia USDC address
 `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238`. Use Circle's faucet for testnet
 USDC and ensure the selected Trezor account has Sepolia ETH for gas. Add
-`--self-relay` only when the same account also has Base Sepolia ETH for the
-destination `receiveMessage` transaction.
+Base Sepolia ETH to the fallback relay account if you want the CLI to recover
+when permissionless relaying does not complete. Add `--self-relay` only when you
+want to skip the relayer wait and submit the destination `receiveMessage`
+transaction yourself immediately.
 
 The CLI also loads `.env` from the current directory or a parent directory
 before resolving configuration. Keep real RPC URLs in local `.env`;
@@ -123,15 +126,15 @@ cctp bridge \
   --max-fee-usdc 0.01
 ```
 
-By default the CLI waits for any relayer to complete the destination mint. It
-uses a read-only destination provider and does not initialize a destination
-signer or require destination-chain gas in the Trezor account.
+By default the CLI waits for any relayer to complete the destination mint. If
+the relayer wait expires, it falls back to self-relay with the destination relay
+signer shown in the bridge intent. The fallback account must hold destination
+chain gas only if fallback self-relay is needed: HyperEVM for
+`ethereum -> hyperevm`, or Base Sepolia for `ethereum-sepolia -> base-sepolia`.
+The fallback signer defaults to `--trezor-account`, but can be selected
+independently with `--relay-trezor-account`.
 
-To self-relay, add `--self-relay`; the relay account must hold gas on the
-destination chain: HyperEVM for `ethereum -> hyperevm`, or Base Sepolia for
-`ethereum-sepolia -> base-sepolia`. The relay signer defaults to
-`--trezor-account`, but can be selected independently with
-`--relay-trezor-account`.
+To skip the relayer wait and self-relay immediately, add `--self-relay`.
 
 Supported routes are explicit CLI catalog entries:
 
