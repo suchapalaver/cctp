@@ -336,7 +336,7 @@ where
         let source_account = source_signer.account;
         let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
         let source_signer_address = source_account.address;
-        let relay = ResolvedRelay::from_mode(config.relay_mode(), relay_account)?;
+        let relay = ResolvedRelay::from_config(config.relay, relay_account)?;
         let workflow_relay = relay.workflow_relay();
         let recipient = config.recipient.resolve(source_signer_address);
 
@@ -529,17 +529,17 @@ where
             args.receive_attempts.or(file.receive_attempts),
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
-        let relay = RelayMode::from_self_relay(self_relay.value);
+        let relay_mode = RelayMode::from_self_relay(self_relay.value);
 
         let source_wallet = WalletConfig::from_kind(wallet.value, trezor_account.value);
         source_wallet.validate()?;
-        let relay_wallet = RelayWalletConfig::new(
-            relay,
+        let relay = RelayConfig::from_mode(
+            relay_mode,
             wallet.value,
             relay_trezor_account.as_ref().map(|account| account.value),
             trezor_account.value,
-        );
-        relay_wallet.validate()?;
+        )?;
+        relay.validate()?;
         let rpc = RpcEndpoints::from_resolved(&resolved_rpc);
         let transfer = transfer_request(fast.value, max_fee_usdc.as_ref())?;
         let recipient =
@@ -556,7 +556,7 @@ where
                 account: trezor_account.source,
             },
             relay_wallet: RelayWalletProvenance::from_config(
-                relay,
+                relay_mode,
                 relay_trezor_account.as_ref().map(|account| account.source),
             ),
             recipient: RecipientProvenance::from_source(
@@ -573,7 +573,7 @@ where
             amount: UsdcAmount::parse_decimal(&amount.value)?,
             rpc,
             source_wallet,
-            relay_wallet,
+            relay,
             recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
             usdc: args.usdc.or(file.usdc).unwrap_or(route.default_usdc()),
             transfer,
@@ -924,7 +924,7 @@ struct BridgeConfig {
     amount: UsdcAmount,
     rpc: RpcEndpoints,
     source_wallet: WalletConfig,
-    relay_wallet: RelayWalletConfig,
+    relay: RelayConfig,
     recipient: RecipientConfig,
     usdc: Address,
     transfer: TransferRequest,
@@ -933,12 +933,6 @@ struct BridgeConfig {
     confirmation: ConfirmationPolicy,
     output: OutputMode,
     provenance: BridgeConfigProvenance,
-}
-
-impl BridgeConfig {
-    const fn relay_mode(&self) -> RelayMode {
-        self.relay_wallet.mode()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1994,49 +1988,49 @@ impl std::fmt::Display for WalletConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelayWalletConfig {
-    None,
-    Trezor { account: u32 },
+enum RelayConfig {
+    WaitForRelayer,
+    SelfRelay { wallet: WalletConfig },
 }
 
-impl RelayWalletConfig {
-    const fn new(
+impl RelayConfig {
+    fn from_mode(
         mode: RelayMode,
         kind: WalletKind,
         relay_trezor_account: Option<u32>,
         source_trezor_account: u32,
-    ) -> Self {
+    ) -> Result<Self> {
         match mode {
-            RelayMode::WaitForRelayer => Self::None,
-            RelayMode::SelfRelay => match kind {
-                WalletKind::Trezor => Self::Trezor {
-                    account: match relay_trezor_account {
-                        Some(account) => account,
-                        None => source_trezor_account,
+            RelayMode::WaitForRelayer => {
+                if relay_trezor_account.is_some() {
+                    bail!("relay_trezor_account is only valid when self_relay is true");
+                }
+                Ok(Self::WaitForRelayer)
+            }
+            RelayMode::SelfRelay => Ok(match kind {
+                WalletKind::Trezor => Self::SelfRelay {
+                    wallet: WalletConfig::Trezor {
+                        account: match relay_trezor_account {
+                            Some(account) => account,
+                            None => source_trezor_account,
+                        },
                     },
                 },
-            },
+            }),
         }
     }
 
     const fn wallet(self) -> Option<WalletConfig> {
         match self {
-            Self::None => None,
-            Self::Trezor { account } => Some(WalletConfig::Trezor { account }),
-        }
-    }
-
-    const fn mode(self) -> RelayMode {
-        match self {
-            Self::None => RelayMode::WaitForRelayer,
-            Self::Trezor { .. } => RelayMode::SelfRelay,
+            Self::WaitForRelayer => None,
+            Self::SelfRelay { wallet } => Some(wallet),
         }
     }
 
     fn validate(self) -> Result<()> {
-        match self.wallet() {
-            Some(wallet) => wallet.validate(),
-            None => Ok(()),
+        match self {
+            Self::WaitForRelayer => Ok(()),
+            Self::SelfRelay { wallet } => wallet.validate(),
         }
     }
 }
@@ -2109,7 +2103,7 @@ impl WalletService for TrezorWalletService {
         &self,
         config: &BridgeConfig,
     ) -> Result<Option<RelaySignerRuntime<TrezorSigner>>> {
-        let Some(wallet) = config.relay_wallet.wallet() else {
+        let Some(wallet) = config.relay.wallet() else {
             return Ok(None);
         };
 
@@ -2403,14 +2397,14 @@ enum ResolvedRelay {
 }
 
 impl ResolvedRelay {
-    fn from_mode(mode: RelayMode, account: Option<WalletAccount>) -> Result<Self> {
-        match (mode, account) {
-            (RelayMode::WaitForRelayer, None) => Ok(Self::WaitForRelayer),
-            (RelayMode::WaitForRelayer, Some(_)) => {
+    fn from_config(config: RelayConfig, account: Option<WalletAccount>) -> Result<Self> {
+        match (config, account) {
+            (RelayConfig::WaitForRelayer, None) => Ok(Self::WaitForRelayer),
+            (RelayConfig::WaitForRelayer, Some(_)) => {
                 bail!("wait-for-relayer workflow must not have a destination relay account")
             }
-            (RelayMode::SelfRelay, Some(account)) => Ok(Self::SelfRelay { account }),
-            (RelayMode::SelfRelay, None) => {
+            (RelayConfig::SelfRelay { .. }, Some(account)) => Ok(Self::SelfRelay { account }),
+            (RelayConfig::SelfRelay { .. }, None) => {
                 bail!("self-relay workflow requires a destination relay account")
             }
         }
@@ -3408,9 +3402,8 @@ mod tests {
         );
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
-        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert_eq!(config.transfer, TransferRequest::Standard);
@@ -3881,10 +3874,11 @@ mod tests {
         args.self_relay = Some(true);
 
         let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay_mode(), RelayMode::SelfRelay);
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 0 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 0 }
+            }
         );
     }
 
@@ -3897,19 +3891,26 @@ mod tests {
         let config = empty_service().bridge_config(args).expect("valid config");
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 2 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 2 }
+            }
         );
     }
 
     #[test]
-    fn config_service_ignores_relay_account_without_self_relay() {
+    fn config_service_rejects_relay_account_without_self_relay() {
         let mut args = sample_args();
         args.relay_trezor_account = Some(2);
 
-        let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+        let error = empty_service()
+            .bridge_config(args)
+            .expect_err("relay account without self-relay is invalid");
+
+        assert!(
+            error.to_string().contains("only valid when self_relay"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3939,16 +3940,16 @@ mod tests {
     }
 
     #[test]
-    fn relay_wallet_config_validates_without_device() {
-        let relay_wallet =
-            RelayWalletConfig::new(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0);
+    fn relay_config_validates_without_device() {
+        let relay = RelayConfig::from_mode(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0)
+            .expect("self-relay config resolves");
 
-        relay_wallet.validate().expect("relay wallet is valid");
+        relay.validate().expect("relay config is valid");
         assert_eq!(
-            relay_wallet.wallet().expect("relay wallet exists"),
+            relay.wallet().expect("relay wallet exists"),
             WalletConfig::Trezor { account: 2 }
         );
-        assert!(RelayWalletConfig::None.validate().is_ok());
+        assert!(RelayConfig::WaitForRelayer.validate().is_ok());
     }
 
     #[test]
@@ -3996,10 +3997,11 @@ receive_interval_secs = 7
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 4 });
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 5 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 5 }
+            }
         );
-        assert_eq!(config.relay_mode(), RelayMode::SelfRelay);
         assert_eq!(
             config.receive_polling,
             ReceivePolling {
@@ -4068,8 +4070,7 @@ dry_run = true
             "https://env.hyperevm.example/"
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 9 });
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
-        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
+        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
         assert_eq!(config.run_mode, BridgeRunMode::DryRun);
         assert_eq!(
             config.provenance.amount,
@@ -4122,8 +4123,7 @@ dry_run = true
         let config = empty_service().bridge_config(args).expect("valid config");
 
         assert_eq!(config.transfer, TransferRequest::Standard);
-        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+        assert_eq!(config.relay, RelayConfig::WaitForRelayer);
         assert_eq!(config.run_mode, BridgeRunMode::Execute);
         assert_eq!(
             config.provenance.fast_mode,
@@ -4407,16 +4407,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
             config.route.source_chain(),
             source_sender(),
         );
-        let relay_account = config
-            .relay_wallet
-            .wallet()
-            .expect("relay wallet")
-            .account_info(
-                WalletRole::DestinationRelay,
-                config.route.destination_label(),
-                config.route.destination_chain(),
-                address!("0000000000000000000000000000000000000004"),
-            );
+        let relay_account = config.relay.wallet().expect("relay wallet").account_info(
+            WalletRole::DestinationRelay,
+            config.route.destination_label(),
+            config.route.destination_chain(),
+            address!("0000000000000000000000000000000000000004"),
+        );
         let provider_validation = ProviderValidation::new(
             config.route,
             config.route.source_chain_id(),
@@ -4474,7 +4470,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             source_sender(),
         );
         let relay_account = config
-            .relay_wallet
+            .relay
             .wallet()
             .expect("self-relay config resolves relay wallet")
             .account_info(
@@ -4822,7 +4818,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             config: &BridgeConfig,
         ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>> {
             self.calls.push("relay_signer");
-            let Some(wallet) = config.relay_wallet.wallet() else {
+            let Some(wallet) = config.relay.wallet() else {
                 return Ok(None);
             };
 
@@ -5147,8 +5143,13 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
     #[test]
     fn resolved_relay_rejects_self_relay_without_relay_account() {
-        let error = ResolvedRelay::from_mode(RelayMode::SelfRelay, None)
-            .expect_err("self-relay without relay account is invalid");
+        let error = ResolvedRelay::from_config(
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 0 },
+            },
+            None,
+        )
+        .expect_err("self-relay without relay account is invalid");
 
         assert!(
             error.to_string().contains("destination relay account"),
