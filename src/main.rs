@@ -336,7 +336,8 @@ where
         let source_account = source_signer.account;
         let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
         let source_signer_address = source_account.address;
-        let relay_signer_address = relay_account.map(|account| account.address);
+        let relay = ResolvedRelay::from_mode(config.relay_mode(), relay_account)?;
+        let workflow_relay = relay.workflow_relay();
         let recipient = config.recipient.resolve(source_signer_address);
 
         let providers =
@@ -354,17 +355,17 @@ where
             &config,
             &providers,
             recipient,
-            resolved_transfer.mode.clone(),
+            resolved_transfer.transfer_mode(),
         );
         let contracts = self.provider_service.contracts(&bridge)?;
         let intent = BridgeIntent::new(
             &config,
             source_account,
             recipient,
-            relay_account,
+            relay,
             provider_validation,
             contracts,
-            resolved_transfer.clone(),
+            resolved_transfer,
         );
         self.reporter.report_intent(&intent)?;
 
@@ -379,11 +380,10 @@ where
 
         let runtime = self.provider_service.runtime(bridge, providers);
         let mut workflow = BridgeWorkflow::new(
-            BridgeWorkflowConfig::new(&config, resolved_transfer.mode),
+            BridgeWorkflowConfig::new(&config, resolved_transfer.transfer_mode(), workflow_relay),
             runtime,
             source_signer_address,
             recipient,
-            relay_signer_address,
         );
         let outcome = workflow.run().await?;
         self.reporter.report_outcome(&outcome)?;
@@ -541,10 +541,7 @@ where
         );
         relay_wallet.validate()?;
         let rpc = RpcEndpoints::from_resolved(&resolved_rpc);
-        let transfer = transfer_request(
-            fast.value,
-            max_fee_usdc.as_ref().map(|max_fee| max_fee.value.as_str()),
-        )?;
+        let transfer = transfer_request(fast.value, max_fee_usdc.as_ref())?;
         let recipient =
             sourced_optional_cli_file(args.recipient, "--recipient", file.recipient, "recipient");
         let provenance = BridgeConfigProvenance {
@@ -567,10 +564,7 @@ where
             ),
             relay_mode: self_relay.source,
             fast_mode: fast.source,
-            max_fee: max_fee_provenance(
-                &transfer,
-                max_fee_usdc.as_ref().map(|max_fee| max_fee.source),
-            )?,
+            max_fee: max_fee_provenance(&transfer),
             output: output.source,
         };
 
@@ -583,7 +577,6 @@ where
             recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
             usdc: args.usdc.or(file.usdc).unwrap_or(route.default_usdc()),
             transfer,
-            relay,
             receive_polling,
             run_mode,
             confirmation: ConfirmationPolicy::from_yes(args.yes),
@@ -894,25 +887,18 @@ impl std::fmt::Display for MaxFeeProvenance {
     }
 }
 
-fn max_fee_provenance(
-    transfer: &TransferRequest,
-    manual_max_fee: Option<ConfigValueSource>,
-) -> Result<MaxFeeProvenance> {
-    Ok(match transfer {
+fn max_fee_provenance(transfer: &TransferRequest) -> MaxFeeProvenance {
+    match transfer {
         TransferRequest::Standard => MaxFeeProvenance::NotApplicable,
         TransferRequest::Fast {
-            manual_max_fee: Some(_),
-        } => MaxFeeProvenance::Manual {
-            source: manual_max_fee.ok_or_else(|| {
-                eyre!("internal error: manual fast fee cap is missing provenance")
-            })?,
-        },
+            fee_cap: FastFeeCapRequest::Manual(cap),
+        } => MaxFeeProvenance::Manual { source: cap.source },
         TransferRequest::Fast {
-            manual_max_fee: None,
+            fee_cap: FastFeeCapRequest::Auto,
         } => MaxFeeProvenance::AutoResolved {
             source: ConfigValueSource::Default("live fee + 20% buffer"),
         },
-    })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -942,7 +928,6 @@ struct BridgeConfig {
     recipient: RecipientConfig,
     usdc: Address,
     transfer: TransferRequest,
-    relay: RelayMode,
     receive_polling: ReceivePolling,
     run_mode: BridgeRunMode,
     confirmation: ConfirmationPolicy,
@@ -950,22 +935,28 @@ struct BridgeConfig {
     provenance: BridgeConfigProvenance,
 }
 
+impl BridgeConfig {
+    const fn relay_mode(&self) -> RelayMode {
+        self.relay_wallet.mode()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BridgeWorkflowConfig {
     amount: UsdcAmount,
     usdc: Address,
     transfer_mode: TransferMode,
-    relay: RelayMode,
+    relay: WorkflowRelay,
     receive_polling: ReceivePolling,
 }
 
 impl BridgeWorkflowConfig {
-    const fn new(config: &BridgeConfig, transfer_mode: TransferMode) -> Self {
+    const fn new(config: &BridgeConfig, transfer_mode: TransferMode, relay: WorkflowRelay) -> Self {
         Self {
             amount: config.amount,
             usdc: config.usdc,
             transfer_mode,
-            relay: config.relay,
+            relay,
             receive_polling: config.receive_polling,
         }
     }
@@ -1009,12 +1000,17 @@ enum CompletionOutcome {
     SelfRelayAlreadyCompleted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowRelay {
+    WaitForRelayer,
+    SelfRelay { submitter: Address },
+}
+
 struct BridgeWorkflow<R> {
     config: BridgeWorkflowConfig,
     runtime: R,
     source_sender: Address,
     recipient: Address,
-    relay_submitter: Option<Address>,
 }
 
 impl<R> BridgeWorkflow<R>
@@ -1026,22 +1022,16 @@ where
         runtime: R,
         source_sender: Address,
         recipient: Address,
-        relay_submitter: Option<Address>,
     ) -> Self {
         Self {
             config,
             runtime,
             source_sender,
             recipient,
-            relay_submitter,
         }
     }
 
     async fn run(&mut self) -> Result<BridgeOutcome> {
-        if self.config.relay == RelayMode::SelfRelay && self.relay_submitter.is_none() {
-            bail!("self-relay workflow requires a destination relay submitter");
-        }
-
         let token_messenger = self.runtime.token_messenger_v2_contract()?;
         let destination_domain = self.runtime.destination_domain_id()?;
         let amount = self.config.amount.atomic();
@@ -1085,7 +1075,7 @@ where
         };
 
         let completion = match self.config.relay {
-            RelayMode::WaitForRelayer => {
+            WorkflowRelay::WaitForRelayer => {
                 self.runtime
                     .wait_for_receive(
                         &message,
@@ -1096,13 +1086,10 @@ where
                     .wrap_err("timed out waiting for destination receive status")?;
                 CompletionOutcome::RelayerCompleted
             }
-            RelayMode::SelfRelay => {
-                let relay_submitter = self
-                    .relay_submitter
-                    .ok_or_else(|| eyre!("self-relay workflow requires a relay submitter"))?;
+            WorkflowRelay::SelfRelay { submitter } => {
                 match self
                     .runtime
-                    .mint_if_needed(message, attestation, relay_submitter)
+                    .mint_if_needed(message, attestation, submitter)
                     .await
                     .wrap_err("failed to self-relay CCTP mint on destination chain")?
                 {
@@ -1733,10 +1720,22 @@ impl ReceivePolling {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransferRequest {
     Standard,
-    Fast { manual_max_fee: Option<UsdcAmount> },
+    Fast { fee_cap: FastFeeCapRequest },
 }
 
-fn transfer_request(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferRequest> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastFeeCapRequest {
+    Auto,
+    Manual(ManualFastFeeCap),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManualFastFeeCap {
+    amount: UsdcAmount,
+    source: ConfigValueSource,
+}
+
+fn transfer_request(fast: bool, max_fee_usdc: Option<&Sourced<String>>) -> Result<TransferRequest> {
     if !fast {
         if max_fee_usdc.is_some() {
             bail!("--max-fee-usdc is only valid with --fast");
@@ -1744,33 +1743,37 @@ fn transfer_request(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferRe
         return Ok(TransferRequest::Standard);
     }
 
-    let manual_max_fee = max_fee_usdc
-        .map(UsdcAmount::parse_decimal)
-        .transpose()
-        .wrap_err("failed to parse --max-fee-usdc")?;
+    let fee_cap = match max_fee_usdc {
+        Some(max_fee) => FastFeeCapRequest::Manual(ManualFastFeeCap {
+            amount: UsdcAmount::parse_decimal(&max_fee.value)
+                .wrap_err("failed to parse --max-fee-usdc")?,
+            source: max_fee.source,
+        }),
+        None => FastFeeCapRequest::Auto,
+    };
 
-    Ok(TransferRequest::Fast { manual_max_fee })
+    Ok(TransferRequest::Fast { fee_cap })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedTransferMode {
-    mode: TransferMode,
-    fee: TransferFeeResolution,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedTransferMode {
+    Standard,
+    Fast(FastTransferFeeResolution),
 }
 
 impl ResolvedTransferMode {
     const fn standard() -> Self {
-        Self {
-            mode: TransferMode::Standard,
-            fee: TransferFeeResolution::Standard,
+        Self::Standard
+    }
+
+    const fn transfer_mode(self) -> TransferMode {
+        match self {
+            Self::Standard => TransferMode::Standard,
+            Self::Fast(fee) => TransferMode::Fast {
+                max_fee: fee.max_fee,
+            },
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransferFeeResolution {
-    Standard,
-    Fast(FastTransferFeeResolution),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1795,13 +1798,13 @@ fn mode_label(mode: &TransferMode) -> &'static str {
 fn resolve_fast_transfer_fee(
     amount: UsdcAmount,
     live_fee: TransferFee,
-    manual_max_fee: Option<UsdcAmount>,
+    fee_cap: FastFeeCapRequest,
 ) -> Result<FastTransferFeeResolution> {
     let live_fee_amount = live_fee.max_fee_with_buffer_percent(amount.atomic(), 0);
 
-    let (max_fee, cap_source) = match manual_max_fee {
-        Some(manual_max_fee) => {
-            let manual_max_fee = manual_max_fee.atomic();
+    let (max_fee, cap_source) = match fee_cap {
+        FastFeeCapRequest::Manual(manual_cap) => {
+            let manual_max_fee = manual_cap.amount.atomic();
             if manual_max_fee < live_fee_amount {
                 bail!(
                     "manual fast-transfer fee cap {} USDC is below the current live fast-transfer fee {} USDC",
@@ -1811,7 +1814,7 @@ fn resolve_fast_transfer_fee(
             }
             (manual_max_fee, FastFeeCapSource::Manual)
         }
-        None => (
+        FastFeeCapRequest::Auto => (
             live_fee.max_fee_with_buffer_percent(amount.atomic(), DEFAULT_FAST_FEE_BUFFER_PERCENT),
             FastFeeCapSource::LiveBuffered {
                 buffer_percent: DEFAULT_FAST_FEE_BUFFER_PERCENT,
@@ -1847,7 +1850,7 @@ where
     ) -> Result<ResolvedTransferMode> {
         match config.transfer {
             TransferRequest::Standard => Ok(ResolvedTransferMode::standard()),
-            TransferRequest::Fast { manual_max_fee } => {
+            TransferRequest::Fast { fee_cap } => {
                 let live_fee = bridge
                     .get_fast_transfer_fee()
                     .await
@@ -1863,14 +1866,9 @@ where
                             config.route
                         )
                     })?;
-                let fee = resolve_fast_transfer_fee(config.amount, live_fee, manual_max_fee)?;
+                let fee = resolve_fast_transfer_fee(config.amount, live_fee, fee_cap)?;
 
-                Ok(ResolvedTransferMode {
-                    mode: TransferMode::Fast {
-                        max_fee: fee.max_fee,
-                    },
-                    fee: TransferFeeResolution::Fast(fee),
-                })
+                Ok(ResolvedTransferMode::Fast(fee))
             }
         }
     }
@@ -2025,6 +2023,13 @@ impl RelayWalletConfig {
         match self {
             Self::None => None,
             Self::Trezor { account } => Some(WalletConfig::Trezor { account }),
+        }
+    }
+
+    const fn mode(self) -> RelayMode {
+        match self {
+            Self::None => RelayMode::WaitForRelayer,
+            Self::Trezor { .. } => RelayMode::SelfRelay,
         }
     }
 
@@ -2391,6 +2396,50 @@ impl BridgeContracts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedRelay {
+    WaitForRelayer,
+    SelfRelay { account: WalletAccount },
+}
+
+impl ResolvedRelay {
+    fn from_mode(mode: RelayMode, account: Option<WalletAccount>) -> Result<Self> {
+        match (mode, account) {
+            (RelayMode::WaitForRelayer, None) => Ok(Self::WaitForRelayer),
+            (RelayMode::WaitForRelayer, Some(_)) => {
+                bail!("wait-for-relayer workflow must not have a destination relay account")
+            }
+            (RelayMode::SelfRelay, Some(account)) => Ok(Self::SelfRelay { account }),
+            (RelayMode::SelfRelay, None) => {
+                bail!("self-relay workflow requires a destination relay account")
+            }
+        }
+    }
+
+    const fn mode(self) -> RelayMode {
+        match self {
+            Self::WaitForRelayer => RelayMode::WaitForRelayer,
+            Self::SelfRelay { .. } => RelayMode::SelfRelay,
+        }
+    }
+
+    const fn account(self) -> Option<WalletAccount> {
+        match self {
+            Self::WaitForRelayer => None,
+            Self::SelfRelay { account } => Some(account),
+        }
+    }
+
+    const fn workflow_relay(self) -> WorkflowRelay {
+        match self {
+            Self::WaitForRelayer => WorkflowRelay::WaitForRelayer,
+            Self::SelfRelay { account } => WorkflowRelay::SelfRelay {
+                submitter: account.address,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BridgeIntent {
     route: RouteConfig,
@@ -2399,8 +2448,7 @@ struct BridgeIntent {
     usdc: Address,
     amount: UsdcAmount,
     transfer: ResolvedTransferMode,
-    relay: RelayMode,
-    relay_account: Option<WalletAccount>,
+    relay: ResolvedRelay,
     provider_validation: ProviderValidation,
     contracts: BridgeContracts,
     provenance: BridgeConfigProvenance,
@@ -2411,7 +2459,7 @@ impl BridgeIntent {
         config: &BridgeConfig,
         source_account: WalletAccount,
         recipient: Address,
-        relay_account: Option<WalletAccount>,
+        relay: ResolvedRelay,
         provider_validation: ProviderValidation,
         contracts: BridgeContracts,
         transfer: ResolvedTransferMode,
@@ -2423,8 +2471,7 @@ impl BridgeIntent {
             usdc: config.usdc,
             amount: config.amount,
             transfer,
-            relay: config.relay,
-            relay_account,
+            relay,
             provider_validation,
             contracts,
             provenance: config.provenance.clone(),
@@ -2540,13 +2587,17 @@ impl HumanReporter {
         );
         self.report_transfer_mode(&intent.transfer, intent.provenance.fast_mode);
         println!("Fee cap source: {}", intent.provenance.max_fee);
-        println!("Relay: {} ({})", intent.relay, intent.provenance.relay_mode);
-        match intent.relay_account {
-            Some(account) => {
+        println!(
+            "Relay: {} ({})",
+            intent.relay.mode(),
+            intent.provenance.relay_mode
+        );
+        match intent.relay {
+            ResolvedRelay::SelfRelay { account } => {
                 self.report_wallet_account("Relay", &account);
                 println!("Relay wallet source: {}", intent.provenance.relay_wallet);
             }
-            None => println!("Destination provider: read-only"),
+            ResolvedRelay::WaitForRelayer => println!("Destination provider: read-only"),
         }
         println!(
             "TokenMessengerV2 approval spender: {}",
@@ -2590,12 +2641,9 @@ impl HumanReporter {
         transfer: &ResolvedTransferMode,
         fast_source: ConfigValueSource,
     ) {
-        println!(
-            "Mode: {} (fast mode {})",
-            mode_label(&transfer.mode),
-            fast_source
-        );
-        if let TransferFeeResolution::Fast(fee) = transfer.fee {
+        let mode = transfer.transfer_mode();
+        println!("Mode: {} (fast mode {})", mode_label(&mode), fast_source);
+        if let ResolvedTransferMode::Fast(fee) = *transfer {
             println!(
                 "Fast live fee: {} bps ({} USDC for this amount)",
                 fee.live_fee.minimum_fee,
@@ -2697,7 +2745,7 @@ where
 
     fn report_workflow_start(&self) -> Result<()> {
         self.report_event(JsonReportEvent::WorkflowStart(JsonWorkflowStart {
-            status: "started",
+            status: JsonWorkflowStatus::Started,
         }))
     }
 
@@ -2973,12 +3021,18 @@ struct JsonDryRunComplete {
 
 #[derive(Serialize)]
 struct JsonWorkflowStart {
-    status: &'static str,
+    status: JsonWorkflowStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonWorkflowStatus {
+    Started,
 }
 
 #[derive(Serialize)]
 struct JsonBridgeOutcome {
-    status: &'static str,
+    status: JsonBridgeStatus,
     source_sender: Address,
     recipient: Address,
     token_messenger: Address,
@@ -2988,6 +3042,12 @@ struct JsonBridgeOutcome {
     attestation: JsonAttestationOutcome,
     completion: JsonCompletionOutcome,
     transactions: JsonTransactions,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonBridgeStatus {
+    Complete,
 }
 
 #[derive(Serialize)]
@@ -3004,14 +3064,26 @@ enum JsonApprovalOutcome {
 
 #[derive(Serialize)]
 struct JsonTransactionStatus {
-    status: &'static str,
+    status: JsonTransactionStatusKind,
     tx_hash: TxHash,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonTransactionStatusKind {
+    Confirmed,
+}
+
+#[derive(Serialize)]
 struct JsonAttestationOutcome {
-    status: &'static str,
+    status: JsonAttestationStatus,
     canonical_message_bytes: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonAttestationStatus {
+    Ready,
 }
 
 #[derive(Serialize)]
@@ -3055,15 +3127,18 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
     JsonBridgeIntent {
         route: JsonRoute(intent.route),
         signer: json_wallet_account(&intent.source_account),
-        relay_signer: intent.relay_account.as_ref().map(json_wallet_account),
+        relay_signer: intent
+            .relay
+            .account()
+            .map(|account| json_wallet_account(&account)),
         recipient: intent.recipient,
         usdc: intent.usdc,
         amount: json_usdc_amount(intent.amount),
         mode: json_transfer_mode(&intent.transfer),
         relay_policy: JsonRelayPolicy {
-            mode: intent.relay,
+            mode: intent.relay.mode(),
             source: intent.provenance.relay_mode,
-            destination_provider: JsonDestinationProvider::from_relay_mode(intent.relay),
+            destination_provider: JsonDestinationProvider::from_relay_mode(intent.relay.mode()),
             relay_wallet: intent.provenance.relay_wallet,
         },
         provider_checks: JsonProviderChecks {
@@ -3121,9 +3196,9 @@ fn json_provider_check(
 }
 
 fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
-    match transfer.fee {
-        TransferFeeResolution::Standard => JsonTransferMode::Standard,
-        TransferFeeResolution::Fast(fee) => JsonTransferMode::Fast {
+    match *transfer {
+        ResolvedTransferMode::Standard => JsonTransferMode::Standard,
+        ResolvedTransferMode::Fast(fee) => JsonTransferMode::Fast {
             fast_fee: JsonFastFee {
                 live_fee_bps: fee.live_fee.minimum_fee,
                 live_fee_amount: json_atomic_usdc_amount(fee.live_fee_amount),
@@ -3160,7 +3235,7 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
     };
 
     JsonBridgeOutcome {
-        status: "complete",
+        status: JsonBridgeStatus::Complete,
         source_sender: outcome.source_sender,
         recipient: outcome.recipient,
         token_messenger: outcome.token_messenger,
@@ -3174,11 +3249,11 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
             ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed { tx_hash },
         },
         burn: JsonTransactionStatus {
-            status: "confirmed",
+            status: JsonTransactionStatusKind::Confirmed,
             tx_hash: outcome.burn_tx,
         },
         attestation: JsonAttestationOutcome {
-            status: "ready",
+            status: JsonAttestationStatus::Ready,
             canonical_message_bytes: outcome.attestation.message_len,
         },
         completion: match outcome.completion {
@@ -3333,7 +3408,7 @@ mod tests {
         );
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
@@ -3686,7 +3761,7 @@ mod tests {
         assert_eq!(
             config.transfer,
             TransferRequest::Fast {
-                manual_max_fee: None
+                fee_cap: FastFeeCapRequest::Auto
             }
         );
         assert_eq!(
@@ -3711,7 +3786,10 @@ mod tests {
         assert_eq!(
             config.transfer,
             TransferRequest::Fast {
-                manual_max_fee: Some(UsdcAmount::from_atomic(U256::from(10_000u64)))
+                fee_cap: FastFeeCapRequest::Manual(ManualFastFeeCap {
+                    amount: UsdcAmount::from_atomic(U256::from(10_000u64)),
+                    source: ConfigValueSource::CliFlag("--max-fee-usdc")
+                })
             }
         );
         assert_eq!(
@@ -3742,8 +3820,8 @@ mod tests {
         let amount = UsdcAmount::from_atomic(U256::from(1_000_000u64));
         let live_fee = TransferFee::new(1000, FeeBps::from_hundredths(100));
 
-        let resolved =
-            resolve_fast_transfer_fee(amount, live_fee, None).expect("fee resolution succeeds");
+        let resolved = resolve_fast_transfer_fee(amount, live_fee, FastFeeCapRequest::Auto)
+            .expect("fee resolution succeeds");
 
         assert_eq!(resolved.live_fee, live_fee);
         assert_eq!(resolved.live_fee_amount, U256::from(100u64));
@@ -3764,7 +3842,10 @@ mod tests {
         let resolved = resolve_fast_transfer_fee(
             amount,
             live_fee,
-            Some(UsdcAmount::from_atomic(U256::from(150u64))),
+            FastFeeCapRequest::Manual(ManualFastFeeCap {
+                amount: UsdcAmount::from_atomic(U256::from(150u64)),
+                source: ConfigValueSource::CliFlag("--max-fee-usdc"),
+            }),
         )
         .expect("fee resolution succeeds");
 
@@ -3781,7 +3862,10 @@ mod tests {
         let error = resolve_fast_transfer_fee(
             amount,
             live_fee,
-            Some(UsdcAmount::from_atomic(U256::from(99u64))),
+            FastFeeCapRequest::Manual(ManualFastFeeCap {
+                amount: UsdcAmount::from_atomic(U256::from(99u64)),
+                source: ConfigValueSource::CliFlag("--max-fee-usdc"),
+            }),
         )
         .expect_err("below-fee cap is invalid");
 
@@ -3797,7 +3881,7 @@ mod tests {
         args.self_relay = Some(true);
 
         let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay, RelayMode::SelfRelay);
+        assert_eq!(config.relay_mode(), RelayMode::SelfRelay);
         assert_eq!(
             config.relay_wallet,
             RelayWalletConfig::Trezor { account: 0 }
@@ -3824,7 +3908,7 @@ mod tests {
         args.relay_trezor_account = Some(2);
 
         let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
     }
 
@@ -3915,7 +3999,7 @@ receive_interval_secs = 7
             config.relay_wallet,
             RelayWalletConfig::Trezor { account: 5 }
         );
-        assert_eq!(config.relay, RelayMode::SelfRelay);
+        assert_eq!(config.relay_mode(), RelayMode::SelfRelay);
         assert_eq!(
             config.receive_polling,
             ReceivePolling {
@@ -3985,7 +4069,7 @@ dry_run = true
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 9 });
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
         assert_eq!(config.run_mode, BridgeRunMode::DryRun);
         assert_eq!(
             config.provenance.amount,
@@ -4038,7 +4122,7 @@ dry_run = true
         let config = empty_service().bridge_config(args).expect("valid config");
 
         assert_eq!(config.transfer, TransferRequest::Standard);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.relay_mode(), RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.run_mode, BridgeRunMode::Execute);
         assert_eq!(
@@ -4349,7 +4433,9 @@ hyperevm_rpc = "https://file.hyperevm.example"
             &config,
             source_account,
             recipient(),
-            Some(relay_account),
+            ResolvedRelay::SelfRelay {
+                account: relay_account,
+            },
             provider_validation,
             contracts,
             ResolvedTransferMode::standard(),
@@ -4362,8 +4448,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
             intent.amount,
             UsdcAmount::from_atomic(U256::from(1_250_000u64))
         );
-        assert_eq!(intent.relay, RelayMode::SelfRelay);
-        assert_eq!(intent.relay_account, Some(relay_account));
+        assert_eq!(
+            intent.relay,
+            ResolvedRelay::SelfRelay {
+                account: relay_account
+            }
+        );
         assert_eq!(intent.provider_validation, provider_validation);
         assert_eq!(intent.contracts, contracts);
         assert_eq!(intent.transfer, ResolvedTransferMode::standard());
@@ -4404,7 +4494,9 @@ hyperevm_rpc = "https://file.hyperevm.example"
             &config,
             source_account,
             recipient(),
-            Some(relay_account),
+            ResolvedRelay::SelfRelay {
+                account: relay_account,
+            },
             provider_validation,
             contracts,
             ResolvedTransferMode::standard(),
@@ -4982,7 +5074,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             allowance,
             ..Default::default()
         };
-        let mut workflow = mock_workflow(RelayMode::WaitForRelayer, None, runtime);
+        let mut workflow = mock_workflow(WorkflowRelay::WaitForRelayer, runtime);
 
         let outcome = workflow.run().await.expect("workflow succeeds");
 
@@ -5016,7 +5108,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
             mint_result: MintResult::Minted(tx_hash(0x33)),
             ..Default::default()
         };
-        let mut workflow = mock_workflow(RelayMode::SelfRelay, Some(relay_submitter), runtime);
+        let mut workflow = mock_workflow(
+            WorkflowRelay::SelfRelay {
+                submitter: relay_submitter,
+            },
+            runtime,
+        );
 
         let outcome = workflow.run().await.expect("workflow succeeds");
 
@@ -5048,20 +5145,15 @@ hyperevm_rpc = "https://file.hyperevm.example"
         assert_eq!(workflow.runtime.last_mint_from, Some(relay_submitter));
     }
 
-    #[tokio::test]
-    async fn workflow_rejects_self_relay_without_relay_submitter_before_side_effects() {
-        let mut workflow = mock_workflow(RelayMode::SelfRelay, None, MockBridgeRuntime::default());
-
-        let error = workflow
-            .run()
-            .await
-            .expect_err("workflow rejects missing relay");
+    #[test]
+    fn resolved_relay_rejects_self_relay_without_relay_account() {
+        let error = ResolvedRelay::from_mode(RelayMode::SelfRelay, None)
+            .expect_err("self-relay without relay account is invalid");
 
         assert!(
-            error.to_string().contains("destination relay submitter"),
+            error.to_string().contains("destination relay account"),
             "unexpected error: {error}"
         );
-        assert!(workflow.runtime.calls.is_empty());
     }
 
     const MOCK_MESSAGE: &[u8] = &[0xaa, 0xbb, 0xcc];
@@ -5091,8 +5183,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     fn mock_workflow(
-        relay: RelayMode,
-        relay_submitter: Option<Address>,
+        relay: WorkflowRelay,
         runtime: MockBridgeRuntime,
     ) -> BridgeWorkflow<MockBridgeRuntime> {
         BridgeWorkflow::new(
@@ -5109,7 +5200,6 @@ hyperevm_rpc = "https://file.hyperevm.example"
             runtime,
             source_sender(),
             recipient(),
-            relay_submitter,
         )
     }
 
