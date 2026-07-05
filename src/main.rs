@@ -18,7 +18,7 @@ use cctp_rs::{
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -2879,10 +2879,18 @@ struct JsonContracts {
     destination_domain: JsonCctpDomain,
 }
 
-#[derive(Serialize)]
-struct JsonCctpDomain {
-    domain: DomainId,
-    domain_id: u32,
+struct JsonCctpDomain(DomainId);
+
+impl Serialize for JsonCctpDomain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JsonCctpDomain", 2)?;
+        state.serialize_field("domain", &self.0)?;
+        state.serialize_field("domain_id", &self.0.as_u32())?;
+        state.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -3094,10 +3102,7 @@ fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
 }
 
 fn json_cctp_domain(domain: DomainId) -> JsonCctpDomain {
-    JsonCctpDomain {
-        domain,
-        domain_id: domain.as_u32(),
-    }
+    JsonCctpDomain(domain)
 }
 
 fn json_usdc_amount(amount: UsdcAmount) -> JsonAmount {
