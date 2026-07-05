@@ -2638,25 +2638,28 @@ where
     S: JsonReportSink,
 {
     fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
-        self.report_event("bridge_intent", json_bridge_intent(intent))
+        self.report_event(JsonReportEvent::BridgeIntent(Box::new(json_bridge_intent(
+            intent,
+        ))))
     }
 
     fn report_dry_run_complete(&self) -> Result<()> {
-        self.report_event(
-            "dry_run_complete",
-            JsonDryRunComplete {
-                status: "complete",
-                transactions_sent: false,
-            },
-        )
+        self.report_event(JsonReportEvent::DryRunComplete(JsonDryRunComplete {
+            status: "complete",
+            transactions_sent: false,
+        }))
     }
 
     fn report_workflow_start(&self) -> Result<()> {
-        self.report_event("workflow_start", JsonWorkflowStart { status: "started" })
+        self.report_event(JsonReportEvent::WorkflowStart(JsonWorkflowStart {
+            status: "started",
+        }))
     }
 
     fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
-        self.report_event("bridge_outcome", json_bridge_outcome(outcome))
+        self.report_event(JsonReportEvent::BridgeOutcome(Box::new(
+            json_bridge_outcome(outcome),
+        )))
     }
 }
 
@@ -2664,41 +2667,33 @@ impl<S> JsonReporter<S>
 where
     S: JsonReportSink,
 {
-    fn report_event<T>(&self, event: &'static str, data: T) -> Result<()>
-    where
-        T: Serialize,
-    {
-        self.sink.write_json(&JsonReportEvent { event, data })
+    fn report_event(&self, event: JsonReportEvent) -> Result<()> {
+        self.sink.write_json(&event)
     }
 }
 
 trait JsonReportSink {
-    fn write_json<T>(&self, value: &T) -> Result<()>
-    where
-        T: Serialize;
+    fn write_json(&self, event: &JsonReportEvent) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StdoutJsonReportSink;
 
 impl JsonReportSink for StdoutJsonReportSink {
-    fn write_json<T>(&self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn write_json(&self, event: &JsonReportEvent) -> Result<()> {
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer(&mut stdout, value).wrap_err("failed to write JSON report")?;
+        serde_json::to_writer(&mut stdout, event).wrap_err("failed to write JSON report")?;
         writeln!(stdout).wrap_err("failed to finish JSON report line")
     }
 }
 
 #[derive(Serialize)]
-struct JsonReportEvent<T>
-where
-    T: Serialize,
-{
-    event: &'static str,
-    data: T,
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+enum JsonReportEvent {
+    BridgeIntent(Box<JsonBridgeIntent>),
+    DryRunComplete(JsonDryRunComplete),
+    WorkflowStart(JsonWorkflowStart),
+    BridgeOutcome(Box<JsonBridgeOutcome>),
 }
 
 #[derive(Serialize)]
@@ -2752,9 +2747,10 @@ struct JsonAmount {
 }
 
 #[derive(Serialize)]
-struct JsonTransferMode {
-    mode: &'static str,
-    fast_fee: Option<JsonFastFee>,
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum JsonTransferMode {
+    Standard,
+    Fast { fast_fee: JsonFastFee },
 }
 
 #[derive(Serialize)]
@@ -2847,10 +2843,10 @@ struct JsonBridgeOutcome {
 }
 
 #[derive(Serialize)]
-struct JsonApprovalOutcome {
-    status: &'static str,
-    tx_hash: Option<String>,
-    allowance_atomic: Option<String>,
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JsonApprovalOutcome {
+    SkippedExistingAllowance { allowance_atomic: String },
+    Confirmed { tx_hash: String },
 }
 
 #[derive(Serialize)]
@@ -2866,9 +2862,11 @@ struct JsonAttestationOutcome {
 }
 
 #[derive(Serialize)]
-struct JsonCompletionOutcome {
-    status: &'static str,
-    tx_hash: Option<String>,
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JsonCompletionOutcome {
+    RelayerCompleted,
+    SelfRelayMinted { tx_hash: String },
+    SelfRelayAlreadyCompleted,
 }
 
 #[derive(Serialize)]
@@ -2972,11 +2970,10 @@ fn json_provider_check(
 }
 
 fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
-    JsonTransferMode {
-        mode: mode_label(&transfer.mode),
-        fast_fee: match transfer.fee {
-            TransferFeeResolution::Standard => None,
-            TransferFeeResolution::Fast(fee) => Some(JsonFastFee {
+    match transfer.fee {
+        TransferFeeResolution::Standard => JsonTransferMode::Standard,
+        TransferFeeResolution::Fast(fee) => JsonTransferMode::Fast {
+            fast_fee: JsonFastFee {
                 live_fee_bps: fee.live_fee.minimum_fee.to_string(),
                 live_fee_amount: json_atomic_usdc_amount(fee.live_fee_amount),
                 max_fee: json_atomic_usdc_amount(fee.max_fee),
@@ -2986,7 +2983,7 @@ fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
                     }
                     FastFeeCapSource::Manual => "manual cap".to_owned(),
                 },
-            }),
+            },
         },
     }
 }
@@ -3019,15 +3016,13 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
         token_messenger: outcome.token_messenger.to_string(),
         destination_domain: outcome.destination_domain.to_string(),
         approval: match outcome.approval {
-            ApprovalOutcome::Skipped { allowance } => JsonApprovalOutcome {
-                status: "skipped_existing_allowance",
-                tx_hash: None,
-                allowance_atomic: Some(allowance.to_string()),
-            },
-            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome {
-                status: "confirmed",
-                tx_hash: Some(tx_hash.to_string()),
-                allowance_atomic: None,
+            ApprovalOutcome::Skipped { allowance } => {
+                JsonApprovalOutcome::SkippedExistingAllowance {
+                    allowance_atomic: allowance.to_string(),
+                }
+            }
+            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed {
+                tx_hash: tx_hash.to_string(),
             },
         },
         burn: JsonTransactionStatus {
@@ -3039,18 +3034,15 @@ fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
             canonical_message_bytes: outcome.attestation.message_len,
         },
         completion: match outcome.completion {
-            CompletionOutcome::RelayerCompleted => JsonCompletionOutcome {
-                status: "relayer_completed",
-                tx_hash: None,
-            },
-            CompletionOutcome::SelfRelayMinted { tx_hash } => JsonCompletionOutcome {
-                status: "self_relay_minted",
-                tx_hash: Some(tx_hash.to_string()),
-            },
-            CompletionOutcome::SelfRelayAlreadyCompleted => JsonCompletionOutcome {
-                status: "self_relay_already_completed",
-                tx_hash: None,
-            },
+            CompletionOutcome::RelayerCompleted => JsonCompletionOutcome::RelayerCompleted,
+            CompletionOutcome::SelfRelayMinted { tx_hash } => {
+                JsonCompletionOutcome::SelfRelayMinted {
+                    tx_hash: tx_hash.to_string(),
+                }
+            }
+            CompletionOutcome::SelfRelayAlreadyCompleted => {
+                JsonCompletionOutcome::SelfRelayAlreadyCompleted
+            }
         },
         transactions: JsonTransactions {
             approval: approval_tx,
@@ -4494,12 +4486,9 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     impl JsonReportSink for SharedJsonLines {
-        fn write_json<T>(&self, value: &T) -> Result<()>
-        where
-            T: Serialize,
-        {
+        fn write_json(&self, event: &JsonReportEvent) -> Result<()> {
             let line =
-                serde_json::to_string(value).wrap_err("failed to serialize JSON test line")?;
+                serde_json::to_string(event).wrap_err("failed to serialize JSON test line")?;
             self.0.borrow_mut().push(line);
             Ok(())
         }
