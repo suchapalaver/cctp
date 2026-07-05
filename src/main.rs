@@ -2271,15 +2271,13 @@ impl ProviderValidation {
             source: ProviderChainCheck::validate(
                 route,
                 ProviderEndpointRole::Source,
-                route.source_label(),
-                route.source_chain(),
+                ExpectedProviderChain::new(route.source_label(), route.source_chain()),
                 source_actual_chain_id,
             )?,
             destination: ProviderChainCheck::validate(
                 route,
                 ProviderEndpointRole::Destination,
-                route.destination_label(),
-                route.destination_chain(),
+                ExpectedProviderChain::new(route.destination_label(), route.destination_chain()),
                 destination_actual_chain_id,
             )?,
         })
@@ -2289,21 +2287,36 @@ impl ProviderValidation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderChainCheck {
     role: ProviderEndpointRole,
-    chain_label: &'static str,
-    expected_chain: NamedChain,
+    expected: ExpectedProviderChain,
     actual_chain_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedProviderChain {
+    label: &'static str,
+    chain: NamedChain,
+}
+
+impl ExpectedProviderChain {
+    const fn new(label: &'static str, chain: NamedChain) -> Self {
+        Self { label, chain }
+    }
+
+    fn chain_id(&self) -> u64 {
+        u64::from(self.chain)
+    }
 }
 
 impl ProviderChainCheck {
     fn validate(
         route: RouteConfig,
         role: ProviderEndpointRole,
-        chain_label: &'static str,
-        expected_chain: NamedChain,
+        expected: ExpectedProviderChain,
         actual_chain_id: u64,
     ) -> Result<Self> {
-        let expected_chain_id = u64::from(expected_chain);
+        let expected_chain_id = expected.chain_id();
         if actual_chain_id != expected_chain_id {
+            let chain_label = expected.label;
             bail!(
                 "{} chain ID mismatch for route {route}: expected {expected_chain_id} ({chain_label}), got {actual_chain_id}",
                 role.error_label()
@@ -2312,14 +2325,13 @@ impl ProviderChainCheck {
 
         Ok(Self {
             role,
-            chain_label,
-            expected_chain,
+            expected,
             actual_chain_id,
         })
     }
 
     fn expected_chain_id(&self) -> u64 {
-        u64::from(self.expected_chain)
+        self.expected.chain_id()
     }
 }
 
@@ -2540,7 +2552,7 @@ impl HumanReporter {
         println!(
             "{} verified: {} (chain id {}, endpoint {}, {})",
             check.role.report_label(),
-            check.chain_label,
+            check.expected.label,
             check.actual_chain_id,
             endpoint.redacted_endpoint,
             endpoint.source
@@ -2801,11 +2813,16 @@ struct JsonProviderChecks {
 #[derive(Serialize)]
 struct JsonProviderCheck {
     role: &'static str,
-    chain_label: &'static str,
-    expected_chain: NamedChain,
-    expected_chain_id: u64,
+    expected: JsonExpectedProviderChain,
     actual_chain_id: u64,
     endpoint: JsonRpcEndpoint,
+}
+
+#[derive(Serialize)]
+struct JsonExpectedProviderChain {
+    chain: NamedChain,
+    label: &'static str,
+    chain_id: u64,
 }
 
 #[derive(Serialize)]
@@ -2985,9 +3002,11 @@ fn json_provider_check(
 ) -> JsonProviderCheck {
     JsonProviderCheck {
         role: check.role.report_label(),
-        chain_label: check.chain_label,
-        expected_chain: check.expected_chain,
-        expected_chain_id: check.expected_chain_id(),
+        expected: JsonExpectedProviderChain {
+            chain: check.expected.chain,
+            label: check.expected.label,
+            chain_id: check.expected_chain_id(),
+        },
         actual_chain_id: check.actual_chain_id,
         endpoint: JsonRpcEndpoint {
             redacted: endpoint.redacted_endpoint.clone(),
@@ -4073,8 +4092,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.source,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
-                chain_label: "Ethereum mainnet",
-                expected_chain: NamedChain::Mainnet,
+                expected: ExpectedProviderChain::new("Ethereum mainnet", NamedChain::Mainnet),
                 actual_chain_id: route.source_chain_id()
             }
         );
@@ -4082,8 +4100,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.destination,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
-                chain_label: "HyperEVM",
-                expected_chain: NamedChain::Hyperliquid,
+                expected: ExpectedProviderChain::new("HyperEVM", NamedChain::Hyperliquid),
                 actual_chain_id: route.destination_chain_id()
             }
         );
@@ -4101,8 +4118,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.source,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
-                chain_label: "Ethereum Sepolia testnet",
-                expected_chain: NamedChain::Sepolia,
+                expected: ExpectedProviderChain::new(
+                    "Ethereum Sepolia testnet",
+                    NamedChain::Sepolia
+                ),
                 actual_chain_id: 11_155_111
             }
         );
@@ -4110,8 +4129,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.destination,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
-                chain_label: "Base Sepolia testnet",
-                expected_chain: NamedChain::BaseSepolia,
+                expected: ExpectedProviderChain::new(
+                    "Base Sepolia testnet",
+                    NamedChain::BaseSepolia
+                ),
                 actual_chain_id: 84_532
             }
         );
@@ -4351,7 +4372,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             Some(recipient_address.as_str())
         );
         assert_eq!(
-            events[0]["data"]["provider_checks"]["source"]["expected_chain"].as_str(),
+            events[0]["data"]["provider_checks"]["source"]["expected"]["chain"].as_str(),
             Some("mainnet")
         );
         assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
