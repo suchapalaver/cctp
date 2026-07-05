@@ -13,12 +13,12 @@ use alloy::{
 use alloy_chains::NamedChain;
 use async_trait::async_trait;
 use cctp_rs::{
-    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, MintResult, PollingConfig, TransferFee,
-    TransferMode, UsdcAmount,
+    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, FeeBps, MintResult, PollingConfig,
+    TransferFee, TransferMode, UsdcAmount,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -154,9 +154,13 @@ struct BridgeArgs {
     /// Intended for explicit non-interactive automation. Ignored by --dry-run.
     #[arg(long)]
     yes: bool,
+
+    /// Reporter output mode.
+    #[arg(long, value_enum)]
+    output: Option<OutputMode>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ChainArg {
     #[value(name = "ethereum")]
@@ -210,13 +214,32 @@ impl std::fmt::Display for WalletKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum OutputMode {
+    Human,
+    Json,
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Human => f.write_str("human"),
+            Self::Json => f.write_str("json"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     load_dotenv()?;
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .init();
 
     let cli = Cli::parse();
     match cli.command {
@@ -234,7 +257,10 @@ fn load_dotenv() -> Result<()> {
 
 async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let config = CliConfigService::default().bridge_config(args)?;
-    BridgeApp::production().run(config).await.map(|_| ())
+    BridgeApp::production(config.output)
+        .run(config)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -253,18 +279,18 @@ type ProductionBridgeApp = BridgeApp<
     AlloyProviderValidationService,
     CctpFeeResolutionService,
     TerminalIntentApprovalService,
-    HumanReporter,
+    ConfiguredReporter,
 >;
 
 impl ProductionBridgeApp {
-    const fn production() -> Self {
+    fn production(output: OutputMode) -> Self {
         Self::new(
             TrezorWalletService,
             AlloyProviderService,
             AlloyProviderValidationService,
             CctpFeeResolutionService,
             TerminalIntentApprovalService,
-            HumanReporter,
+            ConfiguredReporter::from_output_mode(output),
         )
     }
 }
@@ -308,9 +334,10 @@ where
         let source_signer = self.wallet_service.source_signer(&config).await?;
         let relay_signer = self.wallet_service.relay_signer(&config).await?;
         let source_account = source_signer.account;
-        let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
+        let relay_account = relay_signer.account;
         let source_signer_address = source_account.address;
-        let relay_signer_address = relay_account.map(|account| account.address);
+        let relay = ResolvedRelay::from_config(config.relay, relay_account);
+        let workflow_relay = relay.workflow_relay();
         let recipient = config.recipient.resolve(source_signer_address);
 
         let providers =
@@ -328,39 +355,38 @@ where
             &config,
             &providers,
             recipient,
-            resolved_transfer.mode.clone(),
+            resolved_transfer.transfer_mode(),
         );
         let contracts = self.provider_service.contracts(&bridge)?;
         let intent = BridgeIntent::new(
             &config,
             source_account,
             recipient,
-            relay_account,
+            relay,
             provider_validation,
             contracts,
-            resolved_transfer.clone(),
+            resolved_transfer,
         );
-        self.reporter.report_intent(&intent);
+        self.reporter.report_intent(&intent)?;
 
-        if config.dry_run {
-            self.reporter.report_dry_run_complete();
+        if config.run_mode.is_dry_run() {
+            self.reporter.report_dry_run_complete()?;
             return Ok(BridgeRunResult::DryRun);
         }
 
         self.approval_service
             .confirm(&intent, config.confirmation)?;
-        self.reporter.report_workflow_start();
+        self.reporter.report_workflow_start()?;
 
         let runtime = self.provider_service.runtime(bridge, providers);
         let mut workflow = BridgeWorkflow::new(
-            BridgeWorkflowConfig::new(&config, resolved_transfer.mode),
+            BridgeWorkflowConfig::new(&config, resolved_transfer.transfer_mode(), workflow_relay),
             runtime,
             source_signer_address,
             recipient,
-            relay_signer_address,
         );
         let outcome = workflow.run().await?;
-        self.reporter.report_outcome(&outcome);
+        self.reporter.report_outcome(&outcome)?;
         Ok(BridgeRunResult::Executed(outcome))
     }
 }
@@ -490,26 +516,32 @@ where
                 "max_fee_usdc",
             )
         };
-        let dry_run = args.dry_run.or(file.dry_run).unwrap_or(false);
+        let run_mode = BridgeRunMode::from_dry_run(args.dry_run.or(file.dry_run).unwrap_or(false));
+        let output = sourced_cli_file_default(
+            args.output,
+            "--output",
+            file.output,
+            "output",
+            OutputMode::Human,
+            "human",
+        );
         let receive_polling = ReceivePolling::new(
             args.receive_attempts.or(file.receive_attempts),
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
+        let relay_mode = RelayMode::from_self_relay(self_relay.value);
 
         let source_wallet = WalletConfig::from_kind(wallet.value, trezor_account.value);
         source_wallet.validate()?;
-        let relay_wallet = RelayWalletConfig::new(
-            self_relay.value,
+        let relay = RelayConfig::from_mode(
+            relay_mode,
             wallet.value,
             relay_trezor_account.as_ref().map(|account| account.value),
             trezor_account.value,
         );
-        relay_wallet.validate()?;
+        relay.validate()?;
         let rpc = RpcEndpoints::from_resolved(&resolved_rpc);
-        let transfer = transfer_request(
-            fast.value,
-            max_fee_usdc.as_ref().map(|max_fee| max_fee.value.as_str()),
-        )?;
+        let transfer = transfer_request(fast.value, max_fee_usdc.as_ref())?;
         let recipient =
             sourced_optional_cli_file(args.recipient, "--recipient", file.recipient, "recipient");
         let provenance = BridgeConfigProvenance {
@@ -524,7 +556,6 @@ where
                 account: trezor_account.source,
             },
             relay_wallet: RelayWalletProvenance::from_config(
-                self_relay.value,
                 relay_trezor_account.as_ref().map(|account| account.source),
             ),
             recipient: RecipientProvenance::from_source(
@@ -532,10 +563,8 @@ where
             ),
             relay_mode: self_relay.source,
             fast_mode: fast.source,
-            max_fee: max_fee_provenance(
-                &transfer,
-                max_fee_usdc.as_ref().map(|max_fee| max_fee.source),
-            )?,
+            max_fee: max_fee_provenance(&transfer),
+            output: output.source,
         };
 
         Ok(BridgeConfig {
@@ -543,14 +572,14 @@ where
             amount: UsdcAmount::parse_decimal(&amount.value)?,
             rpc,
             source_wallet,
-            relay_wallet,
+            relay,
             recipient: RecipientConfig::from(recipient.map(|recipient| recipient.value)),
             usdc: args.usdc.or(file.usdc).unwrap_or(route.default_usdc()),
             transfer,
-            relay: RelayMode::from_self_relay(self_relay.value),
             receive_polling,
-            dry_run,
+            run_mode,
             confirmation: ConfirmationPolicy::from_yes(args.yes),
+            output: output.value,
             provenance,
         })
     }
@@ -577,6 +606,7 @@ struct BridgeConfigFile {
     receive_attempts: Option<u32>,
     receive_interval_secs: Option<u64>,
     dry_run: Option<bool>,
+    output: Option<OutputMode>,
 }
 
 impl BridgeConfigFile {
@@ -703,6 +733,7 @@ struct BridgeConfigProvenance {
     relay_mode: ConfigValueSource,
     fast_mode: ConfigValueSource,
     max_fee: MaxFeeProvenance,
+    output: ConfigValueSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -787,17 +818,12 @@ struct SourceWalletProvenance {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelayWalletProvenance {
-    NotUsed,
     ExplicitAccount { account: ConfigValueSource },
     DefaultedToSourceAccount,
 }
 
 impl RelayWalletProvenance {
-    const fn from_config(self_relay: bool, relay_account: Option<ConfigValueSource>) -> Self {
-        if !self_relay {
-            return Self::NotUsed;
-        }
-
+    const fn from_config(relay_account: Option<ConfigValueSource>) -> Self {
         match relay_account {
             Some(account) => Self::ExplicitAccount { account },
             None => Self::DefaultedToSourceAccount,
@@ -808,7 +834,6 @@ impl RelayWalletProvenance {
 impl std::fmt::Display for RelayWalletProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotUsed => f.write_str("not used"),
             Self::ExplicitAccount { account } => write!(f, "account from {account}"),
             Self::DefaultedToSourceAccount => f.write_str("defaulted to source account"),
         }
@@ -856,25 +881,35 @@ impl std::fmt::Display for MaxFeeProvenance {
     }
 }
 
-fn max_fee_provenance(
-    transfer: &TransferRequest,
-    manual_max_fee: Option<ConfigValueSource>,
-) -> Result<MaxFeeProvenance> {
-    Ok(match transfer {
+fn max_fee_provenance(transfer: &TransferRequest) -> MaxFeeProvenance {
+    match transfer {
         TransferRequest::Standard => MaxFeeProvenance::NotApplicable,
         TransferRequest::Fast {
-            manual_max_fee: Some(_),
-        } => MaxFeeProvenance::Manual {
-            source: manual_max_fee.ok_or_else(|| {
-                eyre!("internal error: manual fast fee cap is missing provenance")
-            })?,
-        },
+            fee_cap: FastFeeCapRequest::Manual(cap),
+        } => MaxFeeProvenance::Manual { source: cap.source },
         TransferRequest::Fast {
-            manual_max_fee: None,
+            fee_cap: FastFeeCapRequest::Auto,
         } => MaxFeeProvenance::AutoResolved {
             source: ConfigValueSource::Default("live fee + 20% buffer"),
         },
-    })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BridgeRunMode {
+    Execute,
+    DryRun,
+}
+
+impl BridgeRunMode {
+    const fn from_dry_run(dry_run: bool) -> Self {
+        if dry_run { Self::DryRun } else { Self::Execute }
+    }
+
+    const fn is_dry_run(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -883,14 +918,14 @@ struct BridgeConfig {
     amount: UsdcAmount,
     rpc: RpcEndpoints,
     source_wallet: WalletConfig,
-    relay_wallet: RelayWalletConfig,
+    relay: RelayConfig,
     recipient: RecipientConfig,
     usdc: Address,
     transfer: TransferRequest,
-    relay: RelayMode,
     receive_polling: ReceivePolling,
-    dry_run: bool,
+    run_mode: BridgeRunMode,
     confirmation: ConfirmationPolicy,
+    output: OutputMode,
     provenance: BridgeConfigProvenance,
 }
 
@@ -899,17 +934,17 @@ struct BridgeWorkflowConfig {
     amount: UsdcAmount,
     usdc: Address,
     transfer_mode: TransferMode,
-    relay: RelayMode,
+    relay: WorkflowRelay,
     receive_polling: ReceivePolling,
 }
 
 impl BridgeWorkflowConfig {
-    const fn new(config: &BridgeConfig, transfer_mode: TransferMode) -> Self {
+    const fn new(config: &BridgeConfig, transfer_mode: TransferMode, relay: WorkflowRelay) -> Self {
         Self {
             amount: config.amount,
             usdc: config.usdc,
             transfer_mode,
-            relay: config.relay,
+            relay,
             receive_polling: config.receive_polling,
         }
     }
@@ -951,6 +986,14 @@ enum CompletionOutcome {
     RelayerCompleted,
     SelfRelayMinted { tx_hash: TxHash },
     SelfRelayAlreadyCompleted,
+    FallbackSelfRelayMinted { tx_hash: TxHash },
+    FallbackSelfRelayAlreadyCompleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowRelay {
+    WaitForRelayer { fallback: WorkflowRelayFallback },
+    SelfRelay { submitter: Address },
 }
 
 struct BridgeWorkflow<R> {
@@ -958,7 +1001,6 @@ struct BridgeWorkflow<R> {
     runtime: R,
     source_sender: Address,
     recipient: Address,
-    relay_submitter: Option<Address>,
 }
 
 impl<R> BridgeWorkflow<R>
@@ -970,22 +1012,16 @@ where
         runtime: R,
         source_sender: Address,
         recipient: Address,
-        relay_submitter: Option<Address>,
     ) -> Self {
         Self {
             config,
             runtime,
             source_sender,
             recipient,
-            relay_submitter,
         }
     }
 
     async fn run(&mut self) -> Result<BridgeOutcome> {
-        if self.config.relay == RelayMode::SelfRelay && self.relay_submitter.is_none() {
-            bail!("self-relay workflow requires a destination relay submitter");
-        }
-
         let token_messenger = self.runtime.token_messenger_v2_contract()?;
         let destination_domain = self.runtime.destination_domain_id()?;
         let amount = self.config.amount.atomic();
@@ -1029,24 +1065,50 @@ where
         };
 
         let completion = match self.config.relay {
-            RelayMode::WaitForRelayer => {
-                self.runtime
+            WorkflowRelay::WaitForRelayer { fallback } => {
+                match self
+                    .runtime
                     .wait_for_receive(
                         &message,
                         self.config.receive_polling.attempts,
                         self.config.receive_polling.interval_secs,
                     )
                     .await
-                    .wrap_err("timed out waiting for destination receive status")?;
-                CompletionOutcome::RelayerCompleted
+                {
+                    Ok(()) => CompletionOutcome::RelayerCompleted,
+                    Err(wait_error) => {
+                        let submitter = fallback.submitter();
+                        match self
+                            .runtime
+                            .mint_if_needed(message, attestation, submitter)
+                            .await
+                            .wrap_err_with(|| {
+                                format!(
+                                    "permissionless relayer did not complete before fallback and fallback self-relay failed: {wait_error}"
+                                )
+                            })? {
+                            MintResult::Minted(tx_hash) => {
+                                self.runtime
+                                    .wait_destination_receipt(
+                                        tx_hash,
+                                        "mint",
+                                        120,
+                                        Duration::from_secs(2),
+                                    )
+                                    .await?;
+                                CompletionOutcome::FallbackSelfRelayMinted { tx_hash }
+                            }
+                            MintResult::AlreadyRelayed => {
+                                CompletionOutcome::FallbackSelfRelayAlreadyCompleted
+                            }
+                        }
+                    }
+                }
             }
-            RelayMode::SelfRelay => {
-                let relay_submitter = self
-                    .relay_submitter
-                    .ok_or_else(|| eyre!("self-relay workflow requires a relay submitter"))?;
+            WorkflowRelay::SelfRelay { submitter } => {
                 match self
                     .runtime
-                    .mint_if_needed(message, attestation, relay_submitter)
+                    .mint_if_needed(message, attestation, submitter)
                     .await
                     .wrap_err("failed to self-relay CCTP mint on destination chain")?
                 {
@@ -1260,11 +1322,11 @@ impl RouteConfig {
     }
 
     fn source_chain_id(&self) -> u64 {
-        u64::from(self.route.source_chain())
+        u64::from(self.source_chain())
     }
 
     fn destination_chain_id(&self) -> u64 {
-        u64::from(self.route.destination_chain())
+        u64::from(self.destination_chain())
     }
 
     const fn cctp_route(&self) -> CctpV2Route {
@@ -1277,6 +1339,14 @@ impl RouteConfig {
 
     const fn to(&self) -> ChainArg {
         self.to
+    }
+
+    const fn source_chain(&self) -> NamedChain {
+        self.from.named_chain()
+    }
+
+    const fn destination_chain(&self) -> NamedChain {
+        self.to.named_chain()
     }
 
     const fn source_label(&self) -> &'static str {
@@ -1556,7 +1626,8 @@ impl From<Option<Address>> for RecipientConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum RelayMode {
     WaitForRelayer,
     SelfRelay,
@@ -1608,15 +1679,20 @@ impl IntentApprovalService for TerminalIntentApprovalService {
     fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()> {
         match policy {
             ConfirmationPolicy::SkipPrompt => {
-                println!("Confirmation skipped by --yes.");
+                let mut stderr = io::stderr().lock();
+                writeln!(stderr, "Confirmation skipped by --yes.")
+                    .wrap_err("failed to write confirmation status")?;
                 Ok(())
             }
             ConfirmationPolicy::RequireInteractive => {
-                print!(
+                let mut stderr = io::stderr().lock();
+                write!(
+                    stderr,
                     "Type CONFIRM to sign and submit this bridge intent for {} USDC: ",
                     intent.amount
-                );
-                io::stdout()
+                )
+                .wrap_err("failed to write confirmation prompt")?;
+                stderr
                     .flush()
                     .wrap_err("failed to flush confirmation prompt")?;
 
@@ -1663,10 +1739,22 @@ impl ReceivePolling {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransferRequest {
     Standard,
-    Fast { manual_max_fee: Option<UsdcAmount> },
+    Fast { fee_cap: FastFeeCapRequest },
 }
 
-fn transfer_request(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferRequest> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastFeeCapRequest {
+    Auto,
+    Manual(ManualFastFeeCap),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManualFastFeeCap {
+    amount: UsdcAmount,
+    source: ConfigValueSource,
+}
+
+fn transfer_request(fast: bool, max_fee_usdc: Option<&Sourced<String>>) -> Result<TransferRequest> {
     if !fast {
         if max_fee_usdc.is_some() {
             bail!("--max-fee-usdc is only valid with --fast");
@@ -1674,33 +1762,37 @@ fn transfer_request(fast: bool, max_fee_usdc: Option<&str>) -> Result<TransferRe
         return Ok(TransferRequest::Standard);
     }
 
-    let manual_max_fee = max_fee_usdc
-        .map(UsdcAmount::parse_decimal)
-        .transpose()
-        .wrap_err("failed to parse --max-fee-usdc")?;
+    let fee_cap = match max_fee_usdc {
+        Some(max_fee) => FastFeeCapRequest::Manual(ManualFastFeeCap {
+            amount: UsdcAmount::parse_decimal(&max_fee.value)
+                .wrap_err("failed to parse --max-fee-usdc")?,
+            source: max_fee.source,
+        }),
+        None => FastFeeCapRequest::Auto,
+    };
 
-    Ok(TransferRequest::Fast { manual_max_fee })
+    Ok(TransferRequest::Fast { fee_cap })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedTransferMode {
-    mode: TransferMode,
-    fee: TransferFeeResolution,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedTransferMode {
+    Standard,
+    Fast(FastTransferFeeResolution),
 }
 
 impl ResolvedTransferMode {
     const fn standard() -> Self {
-        Self {
-            mode: TransferMode::Standard,
-            fee: TransferFeeResolution::Standard,
+        Self::Standard
+    }
+
+    const fn transfer_mode(self) -> TransferMode {
+        match self {
+            Self::Standard => TransferMode::Standard,
+            Self::Fast(fee) => TransferMode::Fast {
+                max_fee: fee.max_fee,
+            },
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransferFeeResolution {
-    Standard,
-    Fast(FastTransferFeeResolution),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1711,7 +1803,8 @@ struct FastTransferFeeResolution {
     cap_source: FastFeeCapSource,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
 enum FastFeeCapSource {
     LiveBuffered { buffer_percent: u32 },
     Manual,
@@ -1724,13 +1817,13 @@ fn mode_label(mode: &TransferMode) -> &'static str {
 fn resolve_fast_transfer_fee(
     amount: UsdcAmount,
     live_fee: TransferFee,
-    manual_max_fee: Option<UsdcAmount>,
+    fee_cap: FastFeeCapRequest,
 ) -> Result<FastTransferFeeResolution> {
     let live_fee_amount = live_fee.max_fee_with_buffer_percent(amount.atomic(), 0);
 
-    let (max_fee, cap_source) = match manual_max_fee {
-        Some(manual_max_fee) => {
-            let manual_max_fee = manual_max_fee.atomic();
+    let (max_fee, cap_source) = match fee_cap {
+        FastFeeCapRequest::Manual(manual_cap) => {
+            let manual_max_fee = manual_cap.amount.atomic();
             if manual_max_fee < live_fee_amount {
                 bail!(
                     "manual fast-transfer fee cap {} USDC is below the current live fast-transfer fee {} USDC",
@@ -1740,7 +1833,7 @@ fn resolve_fast_transfer_fee(
             }
             (manual_max_fee, FastFeeCapSource::Manual)
         }
-        None => (
+        FastFeeCapRequest::Auto => (
             live_fee.max_fee_with_buffer_percent(amount.atomic(), DEFAULT_FAST_FEE_BUFFER_PERCENT),
             FastFeeCapSource::LiveBuffered {
                 buffer_percent: DEFAULT_FAST_FEE_BUFFER_PERCENT,
@@ -1776,7 +1869,7 @@ where
     ) -> Result<ResolvedTransferMode> {
         match config.transfer {
             TransferRequest::Standard => Ok(ResolvedTransferMode::standard()),
-            TransferRequest::Fast { manual_max_fee } => {
+            TransferRequest::Fast { fee_cap } => {
                 let live_fee = bridge
                     .get_fast_transfer_fee()
                     .await
@@ -1792,14 +1885,9 @@ where
                             config.route
                         )
                     })?;
-                let fee = resolve_fast_transfer_fee(config.amount, live_fee, manual_max_fee)?;
+                let fee = resolve_fast_transfer_fee(config.amount, live_fee, fee_cap)?;
 
-                Ok(ResolvedTransferMode {
-                    mode: TransferMode::Fast {
-                        max_fee: fee.max_fee,
-                    },
-                    fee: TransferFeeResolution::Fast(fee),
-                })
+                Ok(ResolvedTransferMode::Fast(fee))
             }
         }
     }
@@ -1850,8 +1938,14 @@ struct WalletAccount {
     wallet: WalletConfig,
     derivation_path: WalletDerivationPath,
     chain_label: &'static str,
-    chain_id: u64,
+    chain: NamedChain,
     address: Address,
+}
+
+impl WalletAccount {
+    fn chain_id(&self) -> u64 {
+        u64::from(self.chain)
+    }
 }
 
 impl WalletConfig {
@@ -1871,7 +1965,7 @@ impl WalletConfig {
         self,
         role: WalletRole,
         chain_label: &'static str,
-        chain_id: u64,
+        chain: NamedChain,
         address: Address,
     ) -> WalletAccount {
         WalletAccount {
@@ -1879,7 +1973,7 @@ impl WalletConfig {
             wallet: self,
             derivation_path: self.derivation_path(),
             chain_label,
-            chain_id,
+            chain,
             address,
         }
     }
@@ -1919,43 +2013,108 @@ impl std::fmt::Display for WalletConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelayWalletConfig {
-    None,
-    Trezor { account: u32 },
+enum RelayConfig {
+    WaitForRelayer { fallback: RelayFallbackConfig },
+    SelfRelay { wallet: WalletConfig },
 }
 
-impl RelayWalletConfig {
-    const fn new(
-        self_relay: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayFallbackConfig {
+    SelfRelay { wallet: WalletConfig },
+}
+
+impl RelayConfig {
+    const fn from_mode(
+        mode: RelayMode,
         kind: WalletKind,
         relay_trezor_account: Option<u32>,
         source_trezor_account: u32,
     ) -> Self {
-        if !self_relay {
-            return Self::None;
-        }
-
-        match kind {
-            WalletKind::Trezor => Self::Trezor {
-                account: match relay_trezor_account {
-                    Some(account) => account,
-                    None => source_trezor_account,
-                },
+        let wallet = relay_wallet_config(kind, relay_trezor_account, source_trezor_account);
+        match mode {
+            RelayMode::WaitForRelayer => Self::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { wallet },
             },
+            RelayMode::SelfRelay => Self::SelfRelay { wallet },
         }
     }
 
-    const fn wallet(self) -> Option<WalletConfig> {
+    const fn wallet(self) -> WalletConfig {
         match self {
-            Self::None => None,
-            Self::Trezor { account } => Some(WalletConfig::Trezor { account }),
+            Self::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { wallet },
+            }
+            | Self::SelfRelay { wallet } => wallet,
         }
     }
 
     fn validate(self) -> Result<()> {
-        match self.wallet() {
-            Some(wallet) => wallet.validate(),
-            None => Ok(()),
+        self.wallet().validate()
+    }
+}
+
+const fn relay_wallet_config(
+    kind: WalletKind,
+    relay_trezor_account: Option<u32>,
+    source_trezor_account: u32,
+) -> WalletConfig {
+    match kind {
+        WalletKind::Trezor => WalletConfig::Trezor {
+            account: match relay_trezor_account {
+                Some(account) => account,
+                None => source_trezor_account,
+            },
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedRelayFallback {
+    SelfRelay { account: WalletAccount },
+}
+
+impl ResolvedRelayFallback {
+    const fn account(self) -> WalletAccount {
+        match self {
+            Self::SelfRelay { account } => account,
+        }
+    }
+
+    const fn workflow(self) -> WorkflowRelayFallback {
+        match self {
+            Self::SelfRelay { account } => WorkflowRelayFallback::SelfRelay {
+                submitter: account.address,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowRelayFallback {
+    SelfRelay { submitter: Address },
+}
+
+impl WorkflowRelayFallback {
+    const fn submitter(self) -> Address {
+        match self {
+            Self::SelfRelay { submitter } => submitter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayPolicyLabel {
+    WaitThenSelfRelay,
+    SelfRelay,
+}
+
+impl std::fmt::Display for RelayPolicyLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WaitThenSelfRelay => {
+                f.write_str("wait for any permissionless relayer, then self-relay fallback")
+            }
+            Self::SelfRelay => f.write_str("self-relay on destination chain"),
         }
     }
 }
@@ -1986,7 +2145,7 @@ trait WalletService {
     async fn relay_signer(
         &self,
         config: &BridgeConfig,
-    ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>>;
+    ) -> Result<RelaySignerRuntime<Self::RelaySigner>>;
 }
 
 #[async_trait(?Send)]
@@ -2017,7 +2176,7 @@ impl WalletService for TrezorWalletService {
         let account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
-            config.route.source_chain_id(),
+            config.route.source_chain(),
             address,
         );
 
@@ -2027,10 +2186,8 @@ impl WalletService for TrezorWalletService {
     async fn relay_signer(
         &self,
         config: &BridgeConfig,
-    ) -> Result<Option<RelaySignerRuntime<TrezorSigner>>> {
-        let Some(wallet) = config.relay_wallet.wallet() else {
-            return Ok(None);
-        };
+    ) -> Result<RelaySignerRuntime<TrezorSigner>> {
+        let wallet = config.relay.wallet();
 
         let signer = wallet
             .trezor_signer(config.route.destination_chain_id())
@@ -2050,11 +2207,11 @@ impl WalletService for TrezorWalletService {
         let account = wallet.account_info(
             WalletRole::DestinationRelay,
             config.route.destination_label(),
-            config.route.destination_chain_id(),
+            config.route.destination_chain(),
             address,
         );
 
-        Ok(Some(RelaySignerRuntime { signer, account }))
+        Ok(RelaySignerRuntime { signer, account })
     }
 }
 
@@ -2081,7 +2238,7 @@ where
         &self,
         config: &BridgeConfig,
         source_signer: W::SourceSigner,
-        relay_signer: Option<RelaySignerRuntime<W::RelaySigner>>,
+        relay_signer: RelaySignerRuntime<W::RelaySigner>,
     ) -> Self::Providers;
 
     fn bridge(
@@ -2117,21 +2274,16 @@ impl ProviderService<TrezorWalletService> for AlloyProviderService {
         &self,
         config: &BridgeConfig,
         source_signer: TrezorSigner,
-        relay_signer: Option<RelaySignerRuntime<TrezorSigner>>,
+        relay_signer: RelaySignerRuntime<TrezorSigner>,
     ) -> BridgeProviders {
         let source = ProviderBuilder::new()
             .wallet(source_signer)
             .connect_http(config.rpc.source.clone())
             .erased();
-        let destination = match relay_signer {
-            Some(runtime) => ProviderBuilder::new()
-                .wallet(runtime.signer)
-                .connect_http(config.rpc.destination.clone())
-                .erased(),
-            None => ProviderBuilder::new()
-                .connect_http(config.rpc.destination.clone())
-                .erased(),
-        };
+        let destination = ProviderBuilder::new()
+            .wallet(relay_signer.signer)
+            .connect_http(config.rpc.destination.clone())
+            .erased();
 
         BridgeProviders {
             source,
@@ -2213,15 +2365,13 @@ impl ProviderValidation {
             source: ProviderChainCheck::validate(
                 route,
                 ProviderEndpointRole::Source,
-                route.source_label(),
-                route.source_chain_id(),
+                ExpectedProviderChain::new(route.source_label(), route.source_chain()),
                 source_actual_chain_id,
             )?,
             destination: ProviderChainCheck::validate(
                 route,
                 ProviderEndpointRole::Destination,
-                route.destination_label(),
-                route.destination_chain_id(),
+                ExpectedProviderChain::new(route.destination_label(), route.destination_chain()),
                 destination_actual_chain_id,
             )?,
         })
@@ -2231,20 +2381,36 @@ impl ProviderValidation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderChainCheck {
     role: ProviderEndpointRole,
-    chain_label: &'static str,
-    expected_chain_id: u64,
+    expected: ExpectedProviderChain,
     actual_chain_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedProviderChain {
+    label: &'static str,
+    chain: NamedChain,
+}
+
+impl ExpectedProviderChain {
+    const fn new(label: &'static str, chain: NamedChain) -> Self {
+        Self { label, chain }
+    }
+
+    fn chain_id(&self) -> u64 {
+        u64::from(self.chain)
+    }
 }
 
 impl ProviderChainCheck {
     fn validate(
         route: RouteConfig,
         role: ProviderEndpointRole,
-        chain_label: &'static str,
-        expected_chain_id: u64,
+        expected: ExpectedProviderChain,
         actual_chain_id: u64,
     ) -> Result<Self> {
+        let expected_chain_id = expected.chain_id();
         if actual_chain_id != expected_chain_id {
+            let chain_label = expected.label;
             bail!(
                 "{} chain ID mismatch for route {route}: expected {expected_chain_id} ({chain_label}), got {actual_chain_id}",
                 role.error_label()
@@ -2253,8 +2419,7 @@ impl ProviderChainCheck {
 
         Ok(Self {
             role,
-            chain_label,
-            expected_chain_id,
+            expected,
             actual_chain_id,
         })
     }
@@ -2302,6 +2467,57 @@ impl BridgeContracts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedRelay {
+    WaitForRelayer { fallback: ResolvedRelayFallback },
+    SelfRelay { account: WalletAccount },
+}
+
+impl ResolvedRelay {
+    const fn from_config(config: RelayConfig, account: WalletAccount) -> Self {
+        match config {
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { .. },
+            } => Self::WaitForRelayer {
+                fallback: ResolvedRelayFallback::SelfRelay { account },
+            },
+            RelayConfig::SelfRelay { .. } => Self::SelfRelay { account },
+        }
+    }
+
+    const fn mode(self) -> RelayMode {
+        match self {
+            Self::WaitForRelayer { .. } => RelayMode::WaitForRelayer,
+            Self::SelfRelay { .. } => RelayMode::SelfRelay,
+        }
+    }
+
+    const fn label(self) -> RelayPolicyLabel {
+        match self {
+            Self::WaitForRelayer { .. } => RelayPolicyLabel::WaitThenSelfRelay,
+            Self::SelfRelay { .. } => RelayPolicyLabel::SelfRelay,
+        }
+    }
+
+    const fn account(self) -> WalletAccount {
+        match self {
+            Self::WaitForRelayer { fallback } => fallback.account(),
+            Self::SelfRelay { account } => account,
+        }
+    }
+
+    const fn workflow_relay(self) -> WorkflowRelay {
+        match self {
+            Self::WaitForRelayer { fallback } => WorkflowRelay::WaitForRelayer {
+                fallback: fallback.workflow(),
+            },
+            Self::SelfRelay { account } => WorkflowRelay::SelfRelay {
+                submitter: account.address,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BridgeIntent {
     route: RouteConfig,
@@ -2310,8 +2526,7 @@ struct BridgeIntent {
     usdc: Address,
     amount: UsdcAmount,
     transfer: ResolvedTransferMode,
-    relay: RelayMode,
-    relay_account: Option<WalletAccount>,
+    relay: ResolvedRelay,
     provider_validation: ProviderValidation,
     contracts: BridgeContracts,
     provenance: BridgeConfigProvenance,
@@ -2322,7 +2537,7 @@ impl BridgeIntent {
         config: &BridgeConfig,
         source_account: WalletAccount,
         recipient: Address,
-        relay_account: Option<WalletAccount>,
+        relay: ResolvedRelay,
         provider_validation: ProviderValidation,
         contracts: BridgeContracts,
         transfer: ResolvedTransferMode,
@@ -2334,11 +2549,55 @@ impl BridgeIntent {
             usdc: config.usdc,
             amount: config.amount,
             transfer,
-            relay: config.relay,
-            relay_account,
+            relay,
             provider_validation,
             contracts,
             provenance: config.provenance.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ConfiguredReporter {
+    Human(HumanReporter),
+    Json(JsonReporter),
+}
+
+impl ConfiguredReporter {
+    fn from_output_mode(output: OutputMode) -> Self {
+        match output {
+            OutputMode::Human => Self::Human(HumanReporter),
+            OutputMode::Json => Self::Json(JsonReporter::stdout()),
+        }
+    }
+}
+
+impl Reporter for ConfiguredReporter {
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_intent(reporter, intent),
+            Self::Json(reporter) => reporter.report_intent(intent),
+        }
+    }
+
+    fn report_dry_run_complete(&self) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_dry_run_complete(reporter),
+            Self::Json(reporter) => reporter.report_dry_run_complete(),
+        }
+    }
+
+    fn report_workflow_start(&self) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_workflow_start(reporter),
+            Self::Json(reporter) => reporter.report_workflow_start(),
+        }
+    }
+
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
+        match self {
+            Self::Human(reporter) => Reporter::report_outcome(reporter, outcome),
+            Self::Json(reporter) => reporter.report_outcome(outcome),
         }
     }
 }
@@ -2347,30 +2606,34 @@ impl BridgeIntent {
 struct HumanReporter;
 
 trait Reporter {
-    fn report_intent(&self, intent: &BridgeIntent);
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()>;
 
-    fn report_dry_run_complete(&self);
+    fn report_dry_run_complete(&self) -> Result<()>;
 
-    fn report_workflow_start(&self);
+    fn report_workflow_start(&self) -> Result<()>;
 
-    fn report_outcome(&self, outcome: &BridgeOutcome);
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()>;
 }
 
 impl Reporter for HumanReporter {
-    fn report_intent(&self, intent: &BridgeIntent) {
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
         HumanReporter::report_intent(self, intent);
+        Ok(())
     }
 
-    fn report_dry_run_complete(&self) {
+    fn report_dry_run_complete(&self) -> Result<()> {
         HumanReporter::report_dry_run_complete(self);
+        Ok(())
     }
 
-    fn report_workflow_start(&self) {
+    fn report_workflow_start(&self) -> Result<()> {
         HumanReporter::report_workflow_start(self);
+        Ok(())
     }
 
-    fn report_outcome(&self, outcome: &BridgeOutcome) {
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
         HumanReporter::report_outcome(self, outcome);
+        Ok(())
     }
 }
 
@@ -2402,13 +2665,21 @@ impl HumanReporter {
         );
         self.report_transfer_mode(&intent.transfer, intent.provenance.fast_mode);
         println!("Fee cap source: {}", intent.provenance.max_fee);
-        println!("Relay: {} ({})", intent.relay, intent.provenance.relay_mode);
-        match intent.relay_account {
-            Some(account) => {
+        println!(
+            "Relay: {} ({})",
+            intent.relay.label(),
+            intent.provenance.relay_mode
+        );
+        match intent.relay {
+            ResolvedRelay::SelfRelay { account } => {
                 self.report_wallet_account("Relay", &account);
                 println!("Relay wallet source: {}", intent.provenance.relay_wallet);
             }
-            None => println!("Destination provider: read-only"),
+            ResolvedRelay::WaitForRelayer { fallback } => {
+                println!("Relay fallback: self-relay if the relayer wait expires");
+                self.report_wallet_account("Relay fallback", &fallback.account());
+                println!("Relay wallet source: {}", intent.provenance.relay_wallet);
+            }
         }
         println!(
             "TokenMessengerV2 approval spender: {}",
@@ -2428,7 +2699,7 @@ impl HumanReporter {
         println!(
             "{} verified: {} (chain id {}, endpoint {}, {})",
             check.role.report_label(),
-            check.chain_label,
+            check.expected.label,
             check.actual_chain_id,
             endpoint.redacted_endpoint,
             endpoint.source
@@ -2441,7 +2712,8 @@ impl HumanReporter {
         println!("{label} derivation: {}", account.derivation_path);
         println!(
             "{label} chain: {} (chain id {})",
-            account.chain_label, account.chain_id
+            account.chain_label,
+            account.chain_id()
         );
         println!("{label} address: {}", account.address);
     }
@@ -2451,12 +2723,9 @@ impl HumanReporter {
         transfer: &ResolvedTransferMode,
         fast_source: ConfigValueSource,
     ) {
-        println!(
-            "Mode: {} (fast mode {})",
-            mode_label(&transfer.mode),
-            fast_source
-        );
-        if let TransferFeeResolution::Fast(fee) = transfer.fee {
+        let mode = transfer.transfer_mode();
+        println!("Mode: {} (fast mode {})", mode_label(&mode), fast_source);
+        if let ResolvedTransferMode::Fast(fee) = *transfer {
             println!(
                 "Fast live fee: {} bps ({} USDC for this amount)",
                 fee.live_fee.minimum_fee,
@@ -2515,8 +2784,597 @@ impl HumanReporter {
             CompletionOutcome::SelfRelayAlreadyCompleted => {
                 println!("Transfer was already completed by a relayer.");
             }
+            CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => {
+                println!("Relayer wait expired; fallback mint tx: {tx_hash}");
+            }
+            CompletionOutcome::FallbackSelfRelayAlreadyCompleted => {
+                println!(
+                    "Relayer wait expired; transfer was already completed before fallback mint."
+                );
+            }
         }
         println!("Transfer complete.");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JsonReporter<S = StdoutJsonReportSink> {
+    sink: S,
+}
+
+impl JsonReporter<StdoutJsonReportSink> {
+    const fn stdout() -> Self {
+        Self {
+            sink: StdoutJsonReportSink,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<S> JsonReporter<S> {
+    const fn new(sink: S) -> Self {
+        Self { sink }
+    }
+}
+
+impl<S> Reporter for JsonReporter<S>
+where
+    S: JsonReportSink,
+{
+    fn report_intent(&self, intent: &BridgeIntent) -> Result<()> {
+        self.report_event(JsonReportEvent::BridgeIntent(Box::new(json_bridge_intent(
+            intent,
+        ))))
+    }
+
+    fn report_dry_run_complete(&self) -> Result<()> {
+        self.report_event(JsonReportEvent::DryRunComplete(JsonDryRunComplete {
+            run_mode: BridgeRunMode::DryRun,
+        }))
+    }
+
+    fn report_workflow_start(&self) -> Result<()> {
+        self.report_event(JsonReportEvent::WorkflowStart(JsonWorkflowStart {
+            status: JsonWorkflowStatus::Started,
+        }))
+    }
+
+    fn report_outcome(&self, outcome: &BridgeOutcome) -> Result<()> {
+        self.report_event(JsonReportEvent::BridgeOutcome(Box::new(
+            json_bridge_outcome(outcome),
+        )))
+    }
+}
+
+impl<S> JsonReporter<S>
+where
+    S: JsonReportSink,
+{
+    fn report_event(&self, event: JsonReportEvent) -> Result<()> {
+        self.sink.write_json(&event)
+    }
+}
+
+trait JsonReportSink {
+    fn write_json(&self, event: &JsonReportEvent) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StdoutJsonReportSink;
+
+impl JsonReportSink for StdoutJsonReportSink {
+    fn write_json(&self, event: &JsonReportEvent) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer(&mut stdout, event).wrap_err("failed to write JSON report")?;
+        writeln!(stdout).wrap_err("failed to finish JSON report line")
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+enum JsonReportEvent {
+    BridgeIntent(Box<JsonBridgeIntent>),
+    DryRunComplete(JsonDryRunComplete),
+    WorkflowStart(JsonWorkflowStart),
+    BridgeOutcome(Box<JsonBridgeOutcome>),
+}
+
+#[derive(Serialize)]
+struct JsonBridgeIntent {
+    route: JsonRoute,
+    signer: JsonWalletAccount,
+    relay_signer: JsonWalletAccount,
+    recipient: Address,
+    usdc: Address,
+    amount: JsonAmount,
+    mode: JsonTransferMode,
+    relay_policy: JsonRelayPolicy,
+    provider_checks: JsonProviderChecks,
+    contracts: JsonContracts,
+    provenance: JsonIntentProvenance,
+}
+
+struct JsonRoute(RouteConfig);
+
+impl Serialize for JsonRoute {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let route = self.0;
+        let mut state = serializer.serialize_struct("JsonRoute", 3)?;
+        state.serialize_field("label", &route.to_string())?;
+        state.serialize_field(
+            "source",
+            &JsonRouteChain {
+                cli: route.from(),
+                label: route.source_label(),
+            },
+        )?;
+        state.serialize_field(
+            "destination",
+            &JsonRouteChain {
+                cli: route.to(),
+                label: route.destination_label(),
+            },
+        )?;
+        state.end()
+    }
+}
+
+struct JsonRouteChain {
+    cli: ChainArg,
+    label: &'static str,
+}
+
+impl Serialize for JsonRouteChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let chain = self.cli.named_chain();
+        let mut state = serializer.serialize_struct("JsonRouteChain", 4)?;
+        state.serialize_field("cli", &self.cli)?;
+        state.serialize_field("chain", &chain)?;
+        state.serialize_field("label", &self.label)?;
+        state.serialize_field("chain_id", &u64::from(chain))?;
+        state.end()
+    }
+}
+
+struct JsonWalletAccount(WalletAccount);
+
+impl Serialize for JsonWalletAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let account = self.0;
+        let mut state = serializer.serialize_struct("JsonWalletAccount", 5)?;
+        state.serialize_field("role", &JsonDisplay(account.role))?;
+        state.serialize_field("wallet", &JsonDisplay(account.wallet))?;
+        state.serialize_field("derivation_path", &JsonDisplay(account.derivation_path))?;
+        state.serialize_field(
+            "chain",
+            &JsonChainIdentity {
+                chain: account.chain,
+                label: account.chain_label,
+            },
+        )?;
+        state.serialize_field("address", &account.address)?;
+        state.end()
+    }
+}
+
+struct JsonChainIdentity {
+    chain: NamedChain,
+    label: &'static str,
+}
+
+impl Serialize for JsonChainIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JsonChainIdentity", 3)?;
+        state.serialize_field("chain", &self.chain)?;
+        state.serialize_field("label", &self.label)?;
+        state.serialize_field("chain_id", &u64::from(self.chain))?;
+        state.end()
+    }
+}
+
+#[derive(Serialize)]
+struct JsonAmount {
+    #[serde(serialize_with = "serialize_display")]
+    usdc: UsdcAmount,
+    #[serde(serialize_with = "serialize_display")]
+    atomic: U256,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum JsonTransferMode {
+    Standard,
+    Fast { fast_fee: JsonFastFee },
+}
+
+#[derive(Serialize)]
+struct JsonFastFee {
+    live_fee_bps: FeeBps,
+    live_fee_amount: JsonAmount,
+    max_fee: JsonAmount,
+    cap_source: FastFeeCapSource,
+}
+
+#[derive(Serialize)]
+struct JsonRelayPolicy {
+    mode: RelayMode,
+    #[serde(serialize_with = "serialize_display")]
+    policy: RelayPolicyLabel,
+    #[serde(serialize_with = "serialize_display")]
+    source: ConfigValueSource,
+    destination_provider: JsonDestinationProvider,
+    fallback: Option<JsonRelayFallbackPolicy>,
+    #[serde(serialize_with = "serialize_display")]
+    relay_wallet: RelayWalletProvenance,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonDestinationProvider {
+    SelfRelaySigner,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonRelayFallbackPolicy {
+    SelfRelaySigner,
+}
+
+#[derive(Serialize)]
+struct JsonProviderChecks {
+    source: JsonProviderCheck,
+    destination: JsonProviderCheck,
+}
+
+#[derive(Serialize)]
+struct JsonProviderCheck {
+    role: &'static str,
+    expected: JsonChainIdentity,
+    actual_chain_id: u64,
+    endpoint: JsonRpcEndpoint,
+}
+
+#[derive(Serialize)]
+struct JsonRpcEndpoint {
+    redacted: String,
+    #[serde(serialize_with = "serialize_display")]
+    source: ConfigValueSource,
+}
+
+#[derive(Serialize)]
+struct JsonContracts {
+    token_messenger: Address,
+    message_transmitter: Address,
+    destination_domain: JsonCctpDomain,
+}
+
+struct JsonCctpDomain(DomainId);
+
+impl Serialize for JsonCctpDomain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JsonCctpDomain", 2)?;
+        state.serialize_field("domain", &self.0)?;
+        state.serialize_field("domain_id", &self.0.as_u32())?;
+        state.end()
+    }
+}
+
+#[derive(Serialize)]
+struct JsonIntentProvenance {
+    #[serde(serialize_with = "serialize_display")]
+    route: RouteConfigProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    amount: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    recipient: RecipientProvenance,
+    source_wallet: JsonSourceWalletProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    relay_wallet: RelayWalletProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    relay_mode: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    fast_mode: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    max_fee: MaxFeeProvenance,
+    #[serde(serialize_with = "serialize_display")]
+    output: ConfigValueSource,
+}
+
+#[derive(Serialize)]
+struct JsonSourceWalletProvenance {
+    #[serde(serialize_with = "serialize_display")]
+    wallet: ConfigValueSource,
+    #[serde(serialize_with = "serialize_display")]
+    account: ConfigValueSource,
+}
+
+#[derive(Serialize)]
+struct JsonDryRunComplete {
+    run_mode: BridgeRunMode,
+}
+
+#[derive(Serialize)]
+struct JsonWorkflowStart {
+    status: JsonWorkflowStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonWorkflowStatus {
+    Started,
+}
+
+#[derive(Serialize)]
+struct JsonBridgeOutcome {
+    status: JsonBridgeStatus,
+    source_sender: Address,
+    recipient: Address,
+    token_messenger: Address,
+    destination_domain: JsonCctpDomain,
+    approval: JsonApprovalOutcome,
+    burn: JsonTransactionStatus,
+    attestation: JsonAttestationOutcome,
+    completion: JsonCompletionOutcome,
+    transactions: JsonTransactions,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonBridgeStatus {
+    Complete,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JsonApprovalOutcome {
+    SkippedExistingAllowance {
+        #[serde(serialize_with = "serialize_display")]
+        allowance_atomic: U256,
+    },
+    Confirmed {
+        tx_hash: TxHash,
+    },
+}
+
+#[derive(Serialize)]
+struct JsonTransactionStatus {
+    status: JsonTransactionStatusKind,
+    tx_hash: TxHash,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonTransactionStatusKind {
+    Confirmed,
+}
+
+#[derive(Serialize)]
+struct JsonAttestationOutcome {
+    status: JsonAttestationStatus,
+    canonical_message_bytes: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JsonAttestationStatus {
+    Ready,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JsonCompletionOutcome {
+    RelayerCompleted,
+    SelfRelayMinted { tx_hash: TxHash },
+    SelfRelayAlreadyCompleted,
+    FallbackSelfRelayMinted { tx_hash: TxHash },
+    FallbackSelfRelayAlreadyCompleted,
+}
+
+#[derive(Serialize)]
+struct JsonTransactions {
+    approval: Option<TxHash>,
+    burn: TxHash,
+    mint: Option<TxHash>,
+}
+
+fn serialize_display<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: std::fmt::Display,
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+struct JsonDisplay<T>(T);
+
+impl<T> Serialize for JsonDisplay<T>
+where
+    T: std::fmt::Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
+    let relay_account = intent.relay.account();
+    JsonBridgeIntent {
+        route: JsonRoute(intent.route),
+        signer: json_wallet_account(&intent.source_account),
+        relay_signer: json_wallet_account(&relay_account),
+        recipient: intent.recipient,
+        usdc: intent.usdc,
+        amount: json_usdc_amount(intent.amount),
+        mode: json_transfer_mode(&intent.transfer),
+        relay_policy: JsonRelayPolicy {
+            mode: intent.relay.mode(),
+            policy: intent.relay.label(),
+            source: intent.provenance.relay_mode,
+            destination_provider: JsonDestinationProvider::SelfRelaySigner,
+            fallback: match intent.relay {
+                ResolvedRelay::WaitForRelayer { .. } => {
+                    Some(JsonRelayFallbackPolicy::SelfRelaySigner)
+                }
+                ResolvedRelay::SelfRelay { .. } => None,
+            },
+            relay_wallet: intent.provenance.relay_wallet,
+        },
+        provider_checks: JsonProviderChecks {
+            source: json_provider_check(
+                &intent.provider_validation.source,
+                &intent.provenance.rpc.source,
+            ),
+            destination: json_provider_check(
+                &intent.provider_validation.destination,
+                &intent.provenance.rpc.destination,
+            ),
+        },
+        contracts: JsonContracts {
+            token_messenger: intent.contracts.token_messenger,
+            message_transmitter: intent.contracts.message_transmitter,
+            destination_domain: json_cctp_domain(intent.contracts.destination_domain),
+        },
+        provenance: JsonIntentProvenance {
+            route: intent.provenance.route,
+            amount: intent.provenance.amount,
+            recipient: intent.provenance.recipient,
+            source_wallet: JsonSourceWalletProvenance {
+                wallet: intent.provenance.source_wallet.wallet,
+                account: intent.provenance.source_wallet.account,
+            },
+            relay_wallet: intent.provenance.relay_wallet,
+            relay_mode: intent.provenance.relay_mode,
+            fast_mode: intent.provenance.fast_mode,
+            max_fee: intent.provenance.max_fee,
+            output: intent.provenance.output,
+        },
+    }
+}
+
+fn json_wallet_account(account: &WalletAccount) -> JsonWalletAccount {
+    JsonWalletAccount(*account)
+}
+
+fn json_provider_check(
+    check: &ProviderChainCheck,
+    endpoint: &RpcEndpointProvenance,
+) -> JsonProviderCheck {
+    JsonProviderCheck {
+        role: check.role.report_label(),
+        expected: JsonChainIdentity {
+            chain: check.expected.chain,
+            label: check.expected.label,
+        },
+        actual_chain_id: check.actual_chain_id,
+        endpoint: JsonRpcEndpoint {
+            redacted: endpoint.redacted_endpoint.clone(),
+            source: endpoint.source,
+        },
+    }
+}
+
+fn json_transfer_mode(transfer: &ResolvedTransferMode) -> JsonTransferMode {
+    match *transfer {
+        ResolvedTransferMode::Standard => JsonTransferMode::Standard,
+        ResolvedTransferMode::Fast(fee) => JsonTransferMode::Fast {
+            fast_fee: JsonFastFee {
+                live_fee_bps: fee.live_fee.minimum_fee,
+                live_fee_amount: json_atomic_usdc_amount(fee.live_fee_amount),
+                max_fee: json_atomic_usdc_amount(fee.max_fee),
+                cap_source: fee.cap_source,
+            },
+        },
+    }
+}
+
+fn json_cctp_domain(domain: DomainId) -> JsonCctpDomain {
+    JsonCctpDomain(domain)
+}
+
+fn json_usdc_amount(amount: UsdcAmount) -> JsonAmount {
+    JsonAmount {
+        usdc: amount,
+        atomic: amount.atomic(),
+    }
+}
+
+fn json_atomic_usdc_amount(atomic: U256) -> JsonAmount {
+    json_usdc_amount(UsdcAmount::from_atomic(atomic))
+}
+
+fn json_bridge_outcome(outcome: &BridgeOutcome) -> JsonBridgeOutcome {
+    let approval_tx = match outcome.approval {
+        ApprovalOutcome::Skipped { .. } => None,
+        ApprovalOutcome::Sent { tx_hash } => Some(tx_hash),
+    };
+    let mint_tx = match outcome.completion {
+        CompletionOutcome::RelayerCompleted
+        | CompletionOutcome::SelfRelayAlreadyCompleted
+        | CompletionOutcome::FallbackSelfRelayAlreadyCompleted => None,
+        CompletionOutcome::SelfRelayMinted { tx_hash }
+        | CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => Some(tx_hash),
+    };
+
+    JsonBridgeOutcome {
+        status: JsonBridgeStatus::Complete,
+        source_sender: outcome.source_sender,
+        recipient: outcome.recipient,
+        token_messenger: outcome.token_messenger,
+        destination_domain: json_cctp_domain(outcome.destination_domain),
+        approval: match outcome.approval {
+            ApprovalOutcome::Skipped { allowance } => {
+                JsonApprovalOutcome::SkippedExistingAllowance {
+                    allowance_atomic: allowance,
+                }
+            }
+            ApprovalOutcome::Sent { tx_hash } => JsonApprovalOutcome::Confirmed { tx_hash },
+        },
+        burn: JsonTransactionStatus {
+            status: JsonTransactionStatusKind::Confirmed,
+            tx_hash: outcome.burn_tx,
+        },
+        attestation: JsonAttestationOutcome {
+            status: JsonAttestationStatus::Ready,
+            canonical_message_bytes: outcome.attestation.message_len,
+        },
+        completion: match outcome.completion {
+            CompletionOutcome::RelayerCompleted => JsonCompletionOutcome::RelayerCompleted,
+            CompletionOutcome::SelfRelayMinted { tx_hash } => {
+                JsonCompletionOutcome::SelfRelayMinted { tx_hash }
+            }
+            CompletionOutcome::SelfRelayAlreadyCompleted => {
+                JsonCompletionOutcome::SelfRelayAlreadyCompleted
+            }
+            CompletionOutcome::FallbackSelfRelayMinted { tx_hash } => {
+                JsonCompletionOutcome::FallbackSelfRelayMinted { tx_hash }
+            }
+            CompletionOutcome::FallbackSelfRelayAlreadyCompleted => {
+                JsonCompletionOutcome::FallbackSelfRelayAlreadyCompleted
+            }
+        },
+        transactions: JsonTransactions {
+            approval: approval_tx,
+            burn: outcome.burn_tx,
+            mint: mint_tx,
+        },
     }
 }
 
@@ -2549,7 +3407,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cctp_rs::FeeBps;
     use std::{
         cell::RefCell,
         collections::HashMap,
@@ -2610,6 +3467,7 @@ mod tests {
             receive_interval_secs: None,
             dry_run: None,
             yes: false,
+            output: None,
         }
     }
 
@@ -2655,13 +3513,20 @@ mod tests {
         );
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 }
+                }
+            }
+        );
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert_eq!(config.transfer, TransferRequest::Standard);
         assert_eq!(config.confirmation, ConfirmationPolicy::RequireInteractive);
+        assert_eq!(config.output, OutputMode::Human);
         assert_eq!(
             config.provenance.route,
             RouteConfigProvenance {
@@ -2694,13 +3559,17 @@ mod tests {
         );
         assert_eq!(
             config.provenance.relay_wallet,
-            RelayWalletProvenance::NotUsed
+            RelayWalletProvenance::DefaultedToSourceAccount
         );
         assert_eq!(
             config.provenance.fast_mode,
             ConfigValueSource::Default("standard finality")
         );
         assert_eq!(config.provenance.max_fee, MaxFeeProvenance::NotApplicable);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::Default("human")
+        );
     }
 
     #[test]
@@ -3003,7 +3872,7 @@ mod tests {
         assert_eq!(
             config.transfer,
             TransferRequest::Fast {
-                manual_max_fee: None
+                fee_cap: FastFeeCapRequest::Auto
             }
         );
         assert_eq!(
@@ -3028,7 +3897,10 @@ mod tests {
         assert_eq!(
             config.transfer,
             TransferRequest::Fast {
-                manual_max_fee: Some(UsdcAmount::from_atomic(U256::from(10_000u64)))
+                fee_cap: FastFeeCapRequest::Manual(ManualFastFeeCap {
+                    amount: UsdcAmount::from_atomic(U256::from(10_000u64)),
+                    source: ConfigValueSource::CliFlag("--max-fee-usdc")
+                })
             }
         );
         assert_eq!(
@@ -3059,8 +3931,8 @@ mod tests {
         let amount = UsdcAmount::from_atomic(U256::from(1_000_000u64));
         let live_fee = TransferFee::new(1000, FeeBps::from_hundredths(100));
 
-        let resolved =
-            resolve_fast_transfer_fee(amount, live_fee, None).expect("fee resolution succeeds");
+        let resolved = resolve_fast_transfer_fee(amount, live_fee, FastFeeCapRequest::Auto)
+            .expect("fee resolution succeeds");
 
         assert_eq!(resolved.live_fee, live_fee);
         assert_eq!(resolved.live_fee_amount, U256::from(100u64));
@@ -3081,7 +3953,10 @@ mod tests {
         let resolved = resolve_fast_transfer_fee(
             amount,
             live_fee,
-            Some(UsdcAmount::from_atomic(U256::from(150u64))),
+            FastFeeCapRequest::Manual(ManualFastFeeCap {
+                amount: UsdcAmount::from_atomic(U256::from(150u64)),
+                source: ConfigValueSource::CliFlag("--max-fee-usdc"),
+            }),
         )
         .expect("fee resolution succeeds");
 
@@ -3098,7 +3973,10 @@ mod tests {
         let error = resolve_fast_transfer_fee(
             amount,
             live_fee,
-            Some(UsdcAmount::from_atomic(U256::from(99u64))),
+            FastFeeCapRequest::Manual(ManualFastFeeCap {
+                amount: UsdcAmount::from_atomic(U256::from(99u64)),
+                source: ConfigValueSource::CliFlag("--max-fee-usdc"),
+            }),
         )
         .expect_err("below-fee cap is invalid");
 
@@ -3114,10 +3992,11 @@ mod tests {
         args.self_relay = Some(true);
 
         let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay, RelayMode::SelfRelay);
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 0 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 0 }
+            }
         );
     }
 
@@ -3130,19 +4009,27 @@ mod tests {
         let config = empty_service().bridge_config(args).expect("valid config");
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 2 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 2 }
+            }
         );
     }
 
     #[test]
-    fn config_service_ignores_relay_account_without_self_relay() {
+    fn config_service_uses_relay_account_for_default_fallback() {
         let mut args = sample_args();
         args.relay_trezor_account = Some(2);
 
         let config = empty_service().bridge_config(args).expect("valid config");
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 2 }
+                }
+            }
+        );
     }
 
     #[test]
@@ -3150,7 +4037,12 @@ mod tests {
         let wallet = WalletConfig::Trezor { account: 3 };
         let address = address!("0000000000000000000000000000000000000003");
 
-        let account = wallet.account_info(WalletRole::SourceBurn, "Ethereum mainnet", 1, address);
+        let account = wallet.account_info(
+            WalletRole::SourceBurn,
+            "Ethereum mainnet",
+            NamedChain::Mainnet,
+            address,
+        );
 
         wallet.validate().expect("wallet config is valid");
         assert_eq!(account.role, WalletRole::SourceBurn);
@@ -3161,20 +4053,22 @@ mod tests {
         );
         assert_eq!(account.derivation_path.to_string(), "m/44'/60'/3'/0/0");
         assert_eq!(account.chain_label, "Ethereum mainnet");
-        assert_eq!(account.chain_id, 1);
+        assert_eq!(account.chain, NamedChain::Mainnet);
+        assert_eq!(account.chain_id(), 1);
         assert_eq!(account.address, address);
     }
 
     #[test]
-    fn relay_wallet_config_validates_without_device() {
-        let relay_wallet = RelayWalletConfig::new(true, WalletKind::Trezor, Some(2), 0);
+    fn relay_config_validates_without_device() {
+        let relay = RelayConfig::from_mode(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0);
 
-        relay_wallet.validate().expect("relay wallet is valid");
-        assert_eq!(
-            relay_wallet.wallet().expect("relay wallet exists"),
-            WalletConfig::Trezor { account: 2 }
+        relay.validate().expect("relay config is valid");
+        assert_eq!(relay.wallet(), WalletConfig::Trezor { account: 2 });
+        assert!(
+            RelayConfig::from_mode(RelayMode::WaitForRelayer, WalletKind::Trezor, None, 0)
+                .validate()
+                .is_ok()
         );
-        assert!(RelayWalletConfig::None.validate().is_ok());
     }
 
     #[test]
@@ -3222,10 +4116,11 @@ receive_interval_secs = 7
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 4 });
         assert_eq!(
-            config.relay_wallet,
-            RelayWalletConfig::Trezor { account: 5 }
+            config.relay,
+            RelayConfig::SelfRelay {
+                wallet: WalletConfig::Trezor { account: 5 }
+            }
         );
-        assert_eq!(config.relay, RelayMode::SelfRelay);
         assert_eq!(
             config.receive_polling,
             ReceivePolling {
@@ -3294,9 +4189,15 @@ dry_run = true
             "https://env.hyperevm.example/"
         );
         assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 9 });
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
-        assert!(config.dry_run);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 9 }
+                }
+            }
+        );
+        assert_eq!(config.run_mode, BridgeRunMode::DryRun);
         assert_eq!(
             config.provenance.amount,
             ConfigValueSource::CliFlag("--amount")
@@ -3348,9 +4249,15 @@ dry_run = true
         let config = empty_service().bridge_config(args).expect("valid config");
 
         assert_eq!(config.transfer, TransferRequest::Standard);
-        assert_eq!(config.relay, RelayMode::WaitForRelayer);
-        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
-        assert!(!config.dry_run);
+        assert_eq!(
+            config.relay,
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 }
+                }
+            }
+        );
+        assert_eq!(config.run_mode, BridgeRunMode::Execute);
         assert_eq!(
             config.provenance.fast_mode,
             ConfigValueSource::CliFlag("--fast")
@@ -3366,6 +4273,62 @@ dry_run = true
         let config = empty_service().bridge_config(args).expect("valid config");
 
         assert_eq!(config.confirmation, ConfirmationPolicy::SkipPrompt);
+    }
+
+    #[test]
+    fn config_service_resolves_output_mode_from_cli_and_file() {
+        let mut args = sample_args();
+        args.output = Some(OutputMode::Json);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Json);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::CliFlag("--output")
+        );
+
+        let path = write_config(
+            r#"
+amount = "1"
+ethereum_rpc = "https://file.ethereum.example"
+hyperevm_rpc = "https://file.hyperevm.example"
+output = "json"
+"#,
+        );
+        let mut args = empty_args();
+        args.config = Some(path);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Json);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::ConfigFile("output")
+        );
+    }
+
+    #[test]
+    fn config_service_cli_output_mode_overrides_file() {
+        let path = write_config(
+            r#"
+amount = "1"
+ethereum_rpc = "https://file.ethereum.example"
+hyperevm_rpc = "https://file.hyperevm.example"
+output = "json"
+"#,
+        );
+        let mut args = empty_args();
+        args.config = Some(path);
+        args.output = Some(OutputMode::Human);
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.output, OutputMode::Human);
+        assert_eq!(
+            config.provenance.output,
+            ConfigValueSource::CliFlag("--output")
+        );
     }
 
     #[test]
@@ -3450,8 +4413,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.source,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
-                chain_label: "Ethereum mainnet",
-                expected_chain_id: route.source_chain_id(),
+                expected: ExpectedProviderChain::new("Ethereum mainnet", NamedChain::Mainnet),
                 actual_chain_id: route.source_chain_id()
             }
         );
@@ -3459,8 +4421,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.destination,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
-                chain_label: "HyperEVM",
-                expected_chain_id: route.destination_chain_id(),
+                expected: ExpectedProviderChain::new("HyperEVM", NamedChain::Hyperliquid),
                 actual_chain_id: route.destination_chain_id()
             }
         );
@@ -3478,8 +4439,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.source,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Source,
-                chain_label: "Ethereum Sepolia testnet",
-                expected_chain_id: 11_155_111,
+                expected: ExpectedProviderChain::new(
+                    "Ethereum Sepolia testnet",
+                    NamedChain::Sepolia
+                ),
                 actual_chain_id: 11_155_111
             }
         );
@@ -3487,8 +4450,10 @@ hyperevm_rpc = "https://file.hyperevm.example"
             validation.destination,
             ProviderChainCheck {
                 role: ProviderEndpointRole::Destination,
-                chain_label: "Base Sepolia testnet",
-                expected_chain_id: 84_532,
+                expected: ExpectedProviderChain::new(
+                    "Base Sepolia testnet",
+                    NamedChain::BaseSepolia
+                ),
                 actual_chain_id: 84_532
             }
         );
@@ -3572,19 +4537,15 @@ hyperevm_rpc = "https://file.hyperevm.example"
         let source_account = config.source_wallet.account_info(
             WalletRole::SourceBurn,
             config.route.source_label(),
-            config.route.source_chain_id(),
+            config.route.source_chain(),
             source_sender(),
         );
-        let relay_account = config
-            .relay_wallet
-            .wallet()
-            .expect("relay wallet")
-            .account_info(
-                WalletRole::DestinationRelay,
-                config.route.destination_label(),
-                config.route.destination_chain_id(),
-                address!("0000000000000000000000000000000000000004"),
-            );
+        let relay_account = config.relay.wallet().account_info(
+            WalletRole::DestinationRelay,
+            config.route.destination_label(),
+            config.route.destination_chain(),
+            address!("0000000000000000000000000000000000000004"),
+        );
         let provider_validation = ProviderValidation::new(
             config.route,
             config.route.source_chain_id(),
@@ -3601,7 +4562,9 @@ hyperevm_rpc = "https://file.hyperevm.example"
             &config,
             source_account,
             recipient(),
-            Some(relay_account),
+            ResolvedRelay::SelfRelay {
+                account: relay_account,
+            },
             provider_validation,
             contracts,
             ResolvedTransferMode::standard(),
@@ -3614,12 +4577,195 @@ hyperevm_rpc = "https://file.hyperevm.example"
             intent.amount,
             UsdcAmount::from_atomic(U256::from(1_250_000u64))
         );
-        assert_eq!(intent.relay, RelayMode::SelfRelay);
-        assert_eq!(intent.relay_account, Some(relay_account));
+        assert_eq!(
+            intent.relay,
+            ResolvedRelay::SelfRelay {
+                account: relay_account
+            }
+        );
         assert_eq!(intent.provider_validation, provider_validation);
         assert_eq!(intent.contracts, contracts);
         assert_eq!(intent.transfer, ResolvedTransferMode::standard());
         assert_eq!(intent.provenance, config.provenance);
+    }
+
+    #[test]
+    fn json_reporter_emits_machine_readable_intent_and_outcome_events() {
+        let mut args = sample_args();
+        args.self_relay = Some(true);
+        args.relay_trezor_account = Some(2);
+        args.output = Some(OutputMode::Json);
+        let config = empty_service().bridge_config(args).expect("valid config");
+        let source_account = config.source_wallet.account_info(
+            WalletRole::SourceBurn,
+            config.route.source_label(),
+            config.route.source_chain(),
+            source_sender(),
+        );
+        let relay_account = config.relay.wallet().account_info(
+            WalletRole::DestinationRelay,
+            config.route.destination_label(),
+            config.route.destination_chain(),
+            address!("0000000000000000000000000000000000000004"),
+        );
+        let provider_validation = ProviderValidation::new(
+            config.route,
+            config.route.source_chain_id(),
+            config.route.destination_chain_id(),
+        )
+        .expect("chain IDs match");
+        let contracts = mock_contracts();
+        let intent = BridgeIntent::new(
+            &config,
+            source_account,
+            recipient(),
+            ResolvedRelay::SelfRelay {
+                account: relay_account,
+            },
+            provider_validation,
+            contracts,
+            ResolvedTransferMode::standard(),
+        );
+        let outcome = BridgeOutcome {
+            source_sender: source_sender(),
+            recipient: recipient(),
+            token_messenger: contracts.token_messenger,
+            destination_domain: contracts.destination_domain,
+            approval: ApprovalOutcome::Sent {
+                tx_hash: tx_hash(0x11),
+            },
+            burn_tx: tx_hash(0x22),
+            attestation: AttestationOutcome {
+                message_len: MOCK_MESSAGE.len(),
+            },
+            completion: CompletionOutcome::SelfRelayMinted {
+                tx_hash: tx_hash(0x33),
+            },
+        };
+        let lines = SharedJsonLines::default();
+        let reporter = JsonReporter::new(lines.clone());
+
+        reporter
+            .report_intent(&intent)
+            .expect("intent JSON event serializes");
+        reporter
+            .report_workflow_start()
+            .expect("workflow JSON event serializes");
+        reporter
+            .report_outcome(&outcome)
+            .expect("outcome JSON event serializes");
+
+        let events = lines.json_values();
+        let source_address = source_sender().to_string();
+        let recipient_address = recipient().to_string();
+        let approval_tx = tx_hash(0x11).to_string();
+        let burn_tx = tx_hash(0x22).to_string();
+        let mint_tx = tx_hash(0x33).to_string();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"].as_str(), Some("bridge_intent"));
+        assert_eq!(
+            events[0]["data"]["route"]["source"]["cli"].as_str(),
+            Some("ethereum")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["source"]["chain"].as_str(),
+            Some("mainnet")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["source"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["cli"].as_str(),
+            Some("hyperevm")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["chain"].as_str(),
+            Some("hyperliquid")
+        );
+        assert_eq!(
+            events[0]["data"]["route"]["destination"]["chain_id"].as_u64(),
+            Some(999)
+        );
+        assert_eq!(
+            events[0]["data"]["signer"]["address"].as_str(),
+            Some(source_address.as_str())
+        );
+        assert_eq!(
+            events[0]["data"]["signer"]["chain"]["chain"].as_str(),
+            Some("mainnet")
+        );
+        assert_eq!(
+            events[0]["data"]["signer"]["chain"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            events[0]["data"]["recipient"].as_str(),
+            Some(recipient_address.as_str())
+        );
+        assert_eq!(
+            events[0]["data"]["provider_checks"]["source"]["expected"]["chain"].as_str(),
+            Some("mainnet")
+        );
+        assert_eq!(
+            events[0]["data"]["provider_checks"]["source"]["expected"]["chain_id"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            events[0]["data"]["contracts"]["destination_domain"]["domain_id"].as_u64(),
+            Some(19)
+        );
+        assert_eq!(events[0]["data"]["amount"]["usdc"].as_str(), Some("1.25"));
+        assert_eq!(
+            events[0]["data"]["amount"]["atomic"].as_str(),
+            Some("1250000")
+        );
+        assert_eq!(events[0]["data"]["mode"]["mode"].as_str(), Some("standard"));
+        assert_eq!(
+            events[0]["data"]["relay_policy"]["mode"].as_str(),
+            Some("self_relay")
+        );
+        assert_eq!(
+            events[0]["data"]["relay_policy"]["policy"].as_str(),
+            Some("self-relay on destination chain")
+        );
+        assert_eq!(
+            events[0]["data"]["relay_policy"]["destination_provider"].as_str(),
+            Some("self_relay_signer")
+        );
+        assert!(events[0]["data"]["relay_policy"]["fallback"].is_null());
+        assert_eq!(
+            events[0]["data"]["provenance"]["output"].as_str(),
+            Some("CLI flag --output")
+        );
+        assert_eq!(events[1]["event"].as_str(), Some("workflow_start"));
+        assert_eq!(events[2]["event"].as_str(), Some("bridge_outcome"));
+        assert_eq!(events[2]["data"]["status"].as_str(), Some("complete"));
+        assert_eq!(
+            events[2]["data"]["destination_domain"]["domain_id"].as_u64(),
+            Some(19)
+        );
+        assert_eq!(
+            events[2]["data"]["approval"]["status"].as_str(),
+            Some("confirmed")
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["approval"].as_str(),
+            Some(approval_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["burn"].as_str(),
+            Some(burn_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["transactions"]["mint"].as_str(),
+            Some(mint_tx.as_str())
+        );
+        assert_eq!(
+            events[2]["data"]["completion"]["status"].as_str(),
+            Some("self_relay_minted")
+        );
     }
 
     #[test]
@@ -3747,6 +4893,31 @@ hyperevm_rpc = "https://file.hyperevm.example"
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct SharedJsonLines(Rc<RefCell<Vec<String>>>);
+
+    impl SharedJsonLines {
+        fn json_values(&self) -> Vec<serde_json::Value> {
+            self.0
+                .borrow()
+                .iter()
+                .map(|line| {
+                    serde_json::from_str(line)
+                        .expect("JSON reporter should emit one valid JSON object per line")
+                })
+                .collect()
+        }
+    }
+
+    impl JsonReportSink for SharedJsonLines {
+        fn write_json(&self, event: &JsonReportEvent) -> Result<()> {
+            let line =
+                serde_json::to_string(event).wrap_err("failed to serialize JSON test line")?;
+            self.0.borrow_mut().push(line);
+            Ok(())
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct MockSigner;
 
@@ -3770,7 +4941,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                 account: config.source_wallet.account_info(
                     WalletRole::SourceBurn,
                     config.route.source_label(),
-                    config.route.source_chain_id(),
+                    config.route.source_chain(),
                     source_sender(),
                 ),
             })
@@ -3779,21 +4950,19 @@ hyperevm_rpc = "https://file.hyperevm.example"
         async fn relay_signer(
             &self,
             config: &BridgeConfig,
-        ) -> Result<Option<RelaySignerRuntime<Self::RelaySigner>>> {
+        ) -> Result<RelaySignerRuntime<Self::RelaySigner>> {
             self.calls.push("relay_signer");
-            let Some(wallet) = config.relay_wallet.wallet() else {
-                return Ok(None);
-            };
+            let wallet = config.relay.wallet();
 
-            Ok(Some(RelaySignerRuntime {
+            Ok(RelaySignerRuntime {
                 signer: MockSigner,
                 account: wallet.account_info(
                     WalletRole::DestinationRelay,
                     config.route.destination_label(),
-                    config.route.destination_chain_id(),
+                    config.route.destination_chain(),
                     address!("0000000000000000000000000000000000000003"),
                 ),
-            }))
+            })
         }
     }
 
@@ -3822,7 +4991,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
             &self,
             _config: &BridgeConfig,
             _source_signer: MockSigner,
-            _relay_signer: Option<RelaySignerRuntime<MockSigner>>,
+            _relay_signer: RelaySignerRuntime<MockSigner>,
         ) -> Self::Providers {
             self.calls.push("bridge_providers");
             MockProviders
@@ -3921,20 +5090,24 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     impl Reporter for MockReporter {
-        fn report_intent(&self, _intent: &BridgeIntent) {
+        fn report_intent(&self, _intent: &BridgeIntent) -> Result<()> {
             self.calls.push("report_intent");
+            Ok(())
         }
 
-        fn report_dry_run_complete(&self) {
+        fn report_dry_run_complete(&self) -> Result<()> {
             self.calls.push("report_dry_run_complete");
+            Ok(())
         }
 
-        fn report_workflow_start(&self) {
+        fn report_workflow_start(&self) -> Result<()> {
             self.calls.push("report_workflow_start");
+            Ok(())
         }
 
-        fn report_outcome(&self, _outcome: &BridgeOutcome) {
+        fn report_outcome(&self, _outcome: &BridgeOutcome) -> Result<()> {
             self.calls.push("report_outcome");
+            Ok(())
         }
     }
 
@@ -4023,13 +5196,21 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[tokio::test]
-    async fn workflow_waits_for_relayer_without_destination_submitter() {
+    async fn workflow_prefers_relayer_before_fallback() {
         let allowance = U256::from(2_000_000u64);
+        let relay_submitter = address!("0000000000000000000000000000000000000003");
         let runtime = MockBridgeRuntime {
             allowance,
             ..Default::default()
         };
-        let mut workflow = mock_workflow(RelayMode::WaitForRelayer, None, runtime);
+        let mut workflow = mock_workflow(
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: relay_submitter,
+                },
+            },
+            runtime,
+        );
 
         let outcome = workflow.run().await.expect("workflow succeeds");
 
@@ -4056,6 +5237,46 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     #[tokio::test]
+    async fn workflow_falls_back_to_self_relay_when_relayer_wait_expires() {
+        let relay_submitter = address!("0000000000000000000000000000000000000003");
+        let runtime = MockBridgeRuntime {
+            receive_completes: false,
+            mint_result: MintResult::Minted(tx_hash(0x33)),
+            ..Default::default()
+        };
+        let mut workflow = mock_workflow(
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: relay_submitter,
+                },
+            },
+            runtime,
+        );
+
+        let outcome = workflow.run().await.expect("workflow succeeds");
+
+        assert_eq!(
+            outcome.completion,
+            CompletionOutcome::FallbackSelfRelayMinted {
+                tx_hash: tx_hash(0x33)
+            }
+        );
+        assert_eq!(
+            workflow.runtime.calls,
+            vec![
+                "get_allowance",
+                "burn",
+                "wait_source_receipt",
+                "get_attestation",
+                "wait_for_receive",
+                "mint_if_needed",
+                "wait_destination_receipt"
+            ]
+        );
+        assert_eq!(workflow.runtime.last_mint_from, Some(relay_submitter));
+    }
+
+    #[tokio::test]
     async fn workflow_self_relays_with_distinct_relay_submitter() {
         let relay_submitter = address!("0000000000000000000000000000000000000003");
         let runtime = MockBridgeRuntime {
@@ -4063,7 +5284,12 @@ hyperevm_rpc = "https://file.hyperevm.example"
             mint_result: MintResult::Minted(tx_hash(0x33)),
             ..Default::default()
         };
-        let mut workflow = mock_workflow(RelayMode::SelfRelay, Some(relay_submitter), runtime);
+        let mut workflow = mock_workflow(
+            WorkflowRelay::SelfRelay {
+                submitter: relay_submitter,
+            },
+            runtime,
+        );
 
         let outcome = workflow.run().await.expect("workflow succeeds");
 
@@ -4095,20 +5321,31 @@ hyperevm_rpc = "https://file.hyperevm.example"
         assert_eq!(workflow.runtime.last_mint_from, Some(relay_submitter));
     }
 
-    #[tokio::test]
-    async fn workflow_rejects_self_relay_without_relay_submitter_before_side_effects() {
-        let mut workflow = mock_workflow(RelayMode::SelfRelay, None, MockBridgeRuntime::default());
-
-        let error = workflow
-            .run()
-            .await
-            .expect_err("workflow rejects missing relay");
-
-        assert!(
-            error.to_string().contains("destination relay submitter"),
-            "unexpected error: {error}"
+    #[test]
+    fn resolved_relay_uses_fallback_account_for_wait_mode() {
+        let account = WalletConfig::Trezor { account: 0 }.account_info(
+            WalletRole::DestinationRelay,
+            "HyperEVM",
+            NamedChain::Hyperliquid,
+            address!("0000000000000000000000000000000000000003"),
         );
-        assert!(workflow.runtime.calls.is_empty());
+        let relay = ResolvedRelay::from_config(
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay {
+                    wallet: WalletConfig::Trezor { account: 0 },
+                },
+            },
+            account,
+        );
+
+        assert_eq!(
+            relay.workflow_relay(),
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: account.address
+                }
+            }
+        );
     }
 
     const MOCK_MESSAGE: &[u8] = &[0xaa, 0xbb, 0xcc];
@@ -4138,8 +5375,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
     }
 
     fn mock_workflow(
-        relay: RelayMode,
-        relay_submitter: Option<Address>,
+        relay: WorkflowRelay,
         runtime: MockBridgeRuntime,
     ) -> BridgeWorkflow<MockBridgeRuntime> {
         BridgeWorkflow::new(
@@ -4156,7 +5392,6 @@ hyperevm_rpc = "https://file.hyperevm.example"
             runtime,
             source_sender(),
             recipient(),
-            relay_submitter,
         )
     }
 
@@ -4167,6 +5402,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
         message: Vec<u8>,
         attestation: AttestationBytes,
         mint_result: MintResult,
+        receive_completes: bool,
         calls: Vec<&'static str>,
         last_mint_from: Option<Address>,
     }
@@ -4180,6 +5416,7 @@ hyperevm_rpc = "https://file.hyperevm.example"
                 message: MOCK_MESSAGE.to_vec(),
                 attestation: vec![0xdd],
                 mint_result: MintResult::AlreadyRelayed,
+                receive_completes: true,
                 calls: Vec::new(),
                 last_mint_from: None,
             }
@@ -4237,7 +5474,11 @@ hyperevm_rpc = "https://file.hyperevm.example"
             _poll_interval: Option<u64>,
         ) -> Result<()> {
             self.calls.push("wait_for_receive");
-            Ok(())
+            if self.receive_completes {
+                Ok(())
+            } else {
+                bail!("destination receive status was not observed")
+            }
         }
 
         async fn mint_if_needed(
