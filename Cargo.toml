@@ -16,7 +16,7 @@ include = [
     "Cargo.lock",
     "README.md",
     ".env.example",
-    "src/main.rs",
+    "src/*.rs",
 ]
 
 [dependencies]
