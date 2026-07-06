@@ -6,15 +6,14 @@ use std::{
 };
 
 use alloy::{
-    primitives::{Address, TxHash, U256, address},
+    primitives::{Address, TxHash, U256},
     providers::{DynProvider, Provider, ProviderBuilder},
     signers::trezor::{HDPath, TrezorSigner},
 };
-use alloy_chains::NamedChain;
 use async_trait::async_trait;
 use cctp_rs::{
-    AttestationBytes, CctpV2Bridge, CctpV2Route, DomainId, FeeBps, MintResult, PollingConfig,
-    TransferFee, TransferMode, UsdcAmount,
+    AttestationBytes, CctpV2Bridge, DomainId, FeeBps, MintResult, PollingConfig, TransferFee,
+    TransferMode, UsdcAmount,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
@@ -23,8 +22,12 @@ use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-const MAINNET_USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-const ETHEREUM_SEPOLIA_USDC: Address = address!("1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+mod chain;
+mod routes;
+
+use chain::ChainArg;
+use routes::{ROUTE_CATALOG, RouteConfig};
+
 const DEFAULT_LOG_FILTER: &str = "info,cctp_rs=info";
 const ETHEREUM_RPC_ENV: &str = "ETHEREUM_RPC_URL";
 const HYPEREVM_RPC_ENV: &str = "HYPEREVM_RPC_URL";
@@ -158,58 +161,6 @@ struct BridgeArgs {
     /// Reporter output mode.
     #[arg(long, value_enum)]
     output: Option<OutputMode>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum ChainArg {
-    #[value(name = "ethereum")]
-    #[serde(rename = "ethereum")]
-    Ethereum,
-    #[value(name = "hyperevm", alias = "hyper-evm", alias = "hyperliquid")]
-    #[serde(rename = "hyperevm", alias = "hyper-evm", alias = "hyperliquid")]
-    HyperEvm,
-    #[value(name = "ethereum-sepolia", alias = "sepolia")]
-    #[serde(rename = "ethereum-sepolia", alias = "sepolia")]
-    EthereumSepolia,
-    #[value(name = "base-sepolia")]
-    #[serde(rename = "base-sepolia")]
-    BaseSepolia,
-}
-
-impl std::fmt::Display for ChainArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ethereum => f.write_str("ethereum"),
-            Self::HyperEvm => f.write_str("hyperevm"),
-            Self::EthereumSepolia => f.write_str("ethereum-sepolia"),
-            Self::BaseSepolia => f.write_str("base-sepolia"),
-        }
-    }
-}
-
-impl ChainArg {
-    const fn named_chain(self) -> NamedChain {
-        match self {
-            Self::Ethereum => NamedChain::Mainnet,
-            Self::HyperEvm => NamedChain::Hyperliquid,
-            Self::EthereumSepolia => NamedChain::Sepolia,
-            Self::BaseSepolia => NamedChain::BaseSepolia,
-        }
-    }
-
-    const fn display_label(self) -> &'static str {
-        match self {
-            Self::Ethereum => "Ethereum mainnet",
-            Self::HyperEvm => "HyperEVM",
-            Self::EthereumSepolia => "Ethereum Sepolia testnet",
-            Self::BaseSepolia => "Base Sepolia testnet",
-        }
-    }
-
-    fn chain_id(self) -> u64 {
-        u64::from(self.named_chain())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -1309,136 +1260,6 @@ where
             interval,
         )
         .await
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RouteConfig {
-    route: CctpV2Route,
-    from: ChainArg,
-    to: ChainArg,
-    default_usdc: Address,
-}
-
-impl RouteConfig {
-    fn from_supported(route: SupportedRoute) -> Result<Self> {
-        Ok(Self {
-            route: CctpV2Route::new(route.source_chain(), route.destination_chain())?,
-            from: route.from,
-            to: route.to,
-            default_usdc: route.default_usdc,
-        })
-    }
-
-    fn source_chain_id(&self) -> u64 {
-        self.from.chain_id()
-    }
-
-    fn destination_chain_id(&self) -> u64 {
-        self.to.chain_id()
-    }
-
-    const fn cctp_route(&self) -> CctpV2Route {
-        self.route
-    }
-
-    const fn from(&self) -> ChainArg {
-        self.from
-    }
-
-    const fn to(&self) -> ChainArg {
-        self.to
-    }
-
-    const fn source_label(&self) -> &'static str {
-        self.from.display_label()
-    }
-
-    const fn destination_label(&self) -> &'static str {
-        self.to.display_label()
-    }
-
-    const fn default_usdc(&self) -> Address {
-        self.default_usdc
-    }
-}
-
-impl std::fmt::Display for RouteConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} -> {}", self.source_label(), self.destination_label())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SupportedRoute {
-    from: ChainArg,
-    to: ChainArg,
-    default_usdc: Address,
-}
-
-impl SupportedRoute {
-    fn matches(self, from: ChainArg, to: ChainArg) -> bool {
-        self.from == from && self.to == to
-    }
-
-    const fn source_chain(self) -> NamedChain {
-        self.from.named_chain()
-    }
-
-    const fn destination_chain(self) -> NamedChain {
-        self.to.named_chain()
-    }
-
-    fn cli_pair(self) -> String {
-        format!("{} -> {}", self.from, self.to)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RouteCatalog;
-
-const ROUTE_CATALOG: RouteCatalog = RouteCatalog;
-
-const SUPPORTED_ROUTES: &[SupportedRoute] = &[
-    SupportedRoute {
-        from: ChainArg::Ethereum,
-        to: ChainArg::HyperEvm,
-        default_usdc: MAINNET_USDC,
-    },
-    SupportedRoute {
-        from: ChainArg::EthereumSepolia,
-        to: ChainArg::BaseSepolia,
-        default_usdc: ETHEREUM_SEPOLIA_USDC,
-    },
-];
-
-impl RouteCatalog {
-    fn resolve(&self, from: ChainArg, to: ChainArg) -> Result<RouteConfig> {
-        let supported = self
-            .supported_routes()
-            .iter()
-            .copied()
-            .find(|route| route.matches(from, to))
-            .ok_or_else(|| {
-                eyre!(
-                    "unsupported route {from} -> {to}; supported routes: {}",
-                    self.supported_routes_description()
-                )
-            })?;
-
-        RouteConfig::from_supported(supported)
-    }
-
-    const fn supported_routes(&self) -> &'static [SupportedRoute] {
-        SUPPORTED_ROUTES
-    }
-
-    fn supported_routes_description(&self) -> String {
-        self.supported_routes()
-            .iter()
-            .map(|route| route.cli_pair())
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }
 
@@ -3383,6 +3204,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::{ETHEREUM_SEPOLIA_USDC, MAINNET_USDC};
+    use alloy::primitives::address;
+    use alloy_chains::NamedChain;
     use std::{
         cell::RefCell,
         collections::HashMap,
