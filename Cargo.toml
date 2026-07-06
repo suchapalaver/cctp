@@ -19,6 +19,9 @@ include = [
     "src/*.rs",
 ]
 
+[lints.rust]
+missing_docs = "deny"
+
 [dependencies]
 alloy = { version = "2.0.5", features = ["signer-trezor"] }
 alloy-chains = { version = "0.2", features = ["serde"] }

@@ -1,3 +1,11 @@
+//! Command-line tool for bridging USDC over Circle CCTP v2 with a Trezor signer.
+//!
+//! Users choose one of the supported routes, provide RPC endpoints for both
+//! chains, review the generated bridge intent, and confirm before any
+//! transaction is signed. The CLI verifies route support and provider chain IDs
+//! before wallet setup so a mismatched route or RPC endpoint fails before it can
+//! affect funds.
+
 use std::{
     fs,
     io::{self, Write},
