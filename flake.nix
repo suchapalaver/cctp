@@ -31,6 +31,7 @@
                 clippy
                 cmake
                 pkg-config
+                rust-analyzer
                 rustc
                 rustfmt
                 stdenv.cc
@@ -39,6 +40,9 @@
                 libusb1
                 udev
               ];
+
+            # Keep rust-analyzer on the same sysroot/src as this shell's rustc.
+            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
         }
       );
