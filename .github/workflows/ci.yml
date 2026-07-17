@@ -30,3 +30,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Docs
+        run: cargo doc --no-deps --locked
+
+      - name: Check package contents
+        run: cargo package --locked --list
