@@ -21,7 +21,16 @@ The source repository, published crate, and installed command are all named
 
 ## Development
 
-This repository includes a Nix flake for a reproducible Rust development shell:
+This repository includes a Nix flake for a reproducible Rust development shell.
+With [direnv](https://direnv.net/) and [nix-direnv](https://github.com/nix-community/nix-direnv),
+entering the repo loads that shell automatically (`.envrc` uses `use flake`).
+Allow it once with `direnv allow`.
+
+In Cursor/VS Code, install the [direnv](https://marketplace.visualstudio.com/items?itemName=mkhl.direnv)
+extension so rust-analyzer inherits the flake toolchain (`cc`, matching
+`rustc`/`rust-analyzer`, and `RUST_SRC_PATH`), then reload the window.
+
+Without direnv, enter the shell manually:
 
 ```sh
 nix develop
