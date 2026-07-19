@@ -1525,6 +1525,10 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use explicit expect messages to assert setup and validation invariants"
+)]
 mod tests {
     use super::*;
     use crate::routes::{ETHEREUM_SEPOLIA_USDC, MAINNET_USDC, ROUTE_CATALOG};
@@ -2153,7 +2157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_app_executes_successful_workflow_with_injected_services() {
+    async fn bridge_app_executes_successful_workflow_with_injected_services() -> Result<()> {
         let calls = SharedCalls::default();
         let config = empty_service()
             .bridge_config(sample_args())
@@ -2163,7 +2167,7 @@ mod tests {
         let result = app.run(config).await.expect("bridge succeeds");
 
         let BridgeRunResult::Executed(outcome) = result else {
-            panic!("expected executed bridge result");
+            bail!("expected executed bridge result");
         };
         assert_eq!(
             outcome.approval,
@@ -2192,6 +2196,7 @@ mod tests {
                 "report_outcome"
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
