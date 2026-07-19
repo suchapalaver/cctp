@@ -6,13 +6,16 @@ use eyre::{Result, WrapErr};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 use crate::chain::ChainArg;
+use crate::config::{
+    BridgeConfig, BridgeConfigProvenance, BridgeRunMode, ConfigValueSource, MaxFeeProvenance,
+    OutputMode, RecipientProvenance, RelayMode, RelayWalletProvenance, RouteConfigProvenance,
+    RpcEndpointProvenance,
+};
 use crate::routes::RouteConfig;
 use crate::{
-    ApprovalOutcome, BridgeConfig, BridgeConfigProvenance, BridgeContracts, BridgeOutcome,
-    BridgeRunMode, CompletionOutcome, ConfigValueSource, FastFeeCapSource, MaxFeeProvenance,
-    OutputMode, ProviderChainCheck, ProviderValidation, RecipientProvenance, RelayMode,
-    RelayPolicyLabel, RelayWalletProvenance, ResolvedRelay, ResolvedTransferMode,
-    RouteConfigProvenance, RpcEndpointProvenance, WalletAccount, mode_label,
+    ApprovalOutcome, BridgeContracts, BridgeOutcome, CompletionOutcome, FastFeeCapSource,
+    ProviderChainCheck, ProviderValidation, RelayPolicyLabel, ResolvedRelay, ResolvedTransferMode,
+    WalletAccount, mode_label,
 };
 
 #[derive(Clone, Debug)]
