@@ -12,11 +12,11 @@ readme = "README.md"
 keywords = ["cctp", "usdc", "circle", "bridge", "trezor"]
 categories = ["command-line-utilities", "finance"]
 include = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    ".env.example",
-    "src/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/.env.example",
+    "/src/*.rs",
 ]
 
 [lints.rust]

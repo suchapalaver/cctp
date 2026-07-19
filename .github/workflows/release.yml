@@ -32,7 +32,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Check package contents
-        run: cargo package --locked --list
+        run: scripts/check-package-contents.sh
 
       - name: Publish dry run
         run: cargo publish --locked --dry-run
