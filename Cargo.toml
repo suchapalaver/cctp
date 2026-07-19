@@ -20,7 +20,9 @@ include = [
 ]
 
 [lints.rust]
+dead_code = "deny"
 missing_docs = "deny"
+unreachable_pub = "deny"
 
 [dependencies]
 alloy = { version = "2.0.5", features = ["signer-trezor"] }
