@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+};
 
 use alloy::primitives::Address;
 use cctp_rs::UsdcAmount;
@@ -175,7 +179,7 @@ where
             OutputMode::Human,
             "human",
         );
-        let receive_polling = ReceivePolling::new(
+        let receive_polling = ReceivePolling::from_overrides(
             args.receive_attempts.or(file.receive_attempts),
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
@@ -801,25 +805,56 @@ impl ConfirmationPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReceivePolling {
-    pub(crate) attempts: Option<u32>,
-    pub(crate) interval_secs: Option<u64>,
+pub(crate) enum ReceivePolling {
+    Default,
+    Attempts(NonZeroU32),
+    Interval(NonZeroU64),
+    AttemptsAndInterval {
+        attempts: NonZeroU32,
+        interval_secs: NonZeroU64,
+    },
 }
 
 impl ReceivePolling {
-    fn new(attempts: Option<u32>, interval_secs: Option<u64>) -> Result<Self> {
-        if matches!(attempts, Some(0)) {
-            bail!("--receive-attempts must be greater than 0");
+    fn from_overrides(attempts: Option<u32>, interval_secs: Option<u64>) -> Result<Self> {
+        match (attempts, interval_secs) {
+            (None, None) => Ok(Self::Default),
+            (Some(attempts), None) => Ok(Self::Attempts(receive_attempts(attempts)?)),
+            (None, Some(interval_secs)) => {
+                Ok(Self::Interval(receive_interval_secs(interval_secs)?))
+            }
+            (Some(attempts), Some(interval_secs)) => Ok(Self::AttemptsAndInterval {
+                attempts: receive_attempts(attempts)?,
+                interval_secs: receive_interval_secs(interval_secs)?,
+            }),
         }
-        if matches!(interval_secs, Some(0)) {
-            bail!("--receive-interval-secs must be greater than 0");
-        }
-
-        Ok(Self {
-            attempts,
-            interval_secs,
-        })
     }
+
+    pub(crate) fn attempts(self) -> Option<u32> {
+        match self {
+            Self::Default | Self::Interval(_) => None,
+            Self::Attempts(attempts) | Self::AttemptsAndInterval { attempts, .. } => {
+                Some(attempts.get())
+            }
+        }
+    }
+
+    pub(crate) fn interval_secs(self) -> Option<u64> {
+        match self {
+            Self::Default | Self::Attempts(_) => None,
+            Self::Interval(interval_secs) | Self::AttemptsAndInterval { interval_secs, .. } => {
+                Some(interval_secs.get())
+            }
+        }
+    }
+}
+
+fn receive_attempts(value: u32) -> Result<NonZeroU32> {
+    NonZeroU32::new(value).ok_or_else(|| eyre!("--receive-attempts must be greater than 0"))
+}
+
+fn receive_interval_secs(value: u64) -> Result<NonZeroU64> {
+    NonZeroU64::new(value).ok_or_else(|| eyre!("--receive-interval-secs must be greater than 0"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -869,6 +904,7 @@ mod tests {
     use alloy_chains::NamedChain;
     use std::{
         collections::HashMap,
+        num::{NonZeroU32, NonZeroU64},
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1458,9 +1494,11 @@ receive_interval_secs = 7
         );
         assert_eq!(
             config.receive_polling,
-            ReceivePolling {
-                attempts: Some(3),
-                interval_secs: Some(7)
+            ReceivePolling::AttemptsAndInterval {
+                attempts: NonZeroU32::new(3)
+                    .expect("literal non-zero receive attempts should construct"),
+                interval_secs: NonZeroU64::new(7)
+                    .expect("literal non-zero receive interval should construct")
             }
         );
         assert_eq!(
@@ -1494,6 +1532,40 @@ receive_interval_secs = 7
             config.provenance.relay_mode,
             ConfigValueSource::ConfigFile("self_relay")
         );
+    }
+
+    #[test]
+    fn receive_polling_resolves_default_and_partial_overrides() {
+        assert_eq!(
+            ReceivePolling::from_overrides(None, None)
+                .expect("absent receive polling overrides should use defaults"),
+            ReceivePolling::Default
+        );
+        assert_eq!(
+            ReceivePolling::from_overrides(Some(3), None)
+                .expect("non-zero receive attempts override should resolve"),
+            ReceivePolling::Attempts(
+                NonZeroU32::new(3).expect("literal non-zero receive attempts should construct")
+            )
+        );
+        assert_eq!(
+            ReceivePolling::from_overrides(None, Some(7))
+                .expect("non-zero receive interval override should resolve"),
+            ReceivePolling::Interval(
+                NonZeroU64::new(7).expect("literal non-zero receive interval should construct")
+            )
+        );
+    }
+
+    #[test]
+    fn receive_polling_rejects_zero_overrides() {
+        let attempts_err = ReceivePolling::from_overrides(Some(0), None)
+            .expect_err("zero receive attempts should be rejected");
+        assert!(attempts_err.to_string().contains("--receive-attempts"));
+
+        let interval_err = ReceivePolling::from_overrides(None, Some(0))
+            .expect_err("zero receive interval should be rejected");
+        assert!(interval_err.to_string().contains("--receive-interval-secs"));
     }
 
     #[test]

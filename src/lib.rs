@@ -484,8 +484,8 @@ where
                     .runtime
                     .wait_for_receive(
                         &message,
-                        self.config.receive_polling.attempts,
-                        self.config.receive_polling.interval_secs,
+                        self.config.receive_polling.attempts(),
+                        self.config.receive_polling.interval_secs(),
                     )
                     .await
                 {
@@ -1528,7 +1528,12 @@ mod tests {
     use alloy::primitives::address;
     use alloy_chains::NamedChain;
     use cctp_rs::FeeBps;
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        num::{NonZeroU32, NonZeroU64},
+        rc::Rc,
+    };
 
     #[derive(Clone, Debug, Default)]
     struct TestEnv(HashMap<String, String>);
@@ -2720,9 +2725,11 @@ mod tests {
                 usdc: MAINNET_USDC,
                 transfer_mode: TransferMode::Standard,
                 relay,
-                receive_polling: ReceivePolling {
-                    attempts: Some(1),
-                    interval_secs: Some(1),
+                receive_polling: ReceivePolling::AttemptsAndInterval {
+                    attempts: NonZeroU32::new(1)
+                        .expect("literal non-zero receive attempts should construct"),
+                    interval_secs: NonZeroU64::new(1)
+                        .expect("literal non-zero receive interval should construct"),
                 },
             },
             runtime,
