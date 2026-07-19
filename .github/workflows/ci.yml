@@ -35,4 +35,4 @@ jobs:
         run: cargo doc --no-deps --locked
 
       - name: Check package contents
-        run: cargo package --locked --list
+        run: scripts/check-package-contents.sh

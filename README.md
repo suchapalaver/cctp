@@ -42,6 +42,7 @@ Run the standard local checks through the shell:
 nix develop -c cargo fmt -- --check
 nix develop -c cargo clippy --all-targets --locked -- -D warnings
 nix develop -c cargo test --locked
+nix develop -c scripts/check-package-contents.sh --allow-dirty
 ```
 
 Agent and Rust production rules for this CLI are documented in
