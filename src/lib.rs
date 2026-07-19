@@ -742,9 +742,12 @@ impl IntentApprovalService for TerminalIntentApprovalService {
                     .wrap_err("failed to flush confirmation prompt")?;
 
                 let mut input = String::new();
-                io::stdin()
+                let bytes_read = io::stdin()
                     .read_line(&mut input)
                     .wrap_err("failed to read confirmation input")?;
+                if bytes_read == 0 {
+                    bail!("bridge intent was not confirmed");
+                }
                 validate_confirmation_input(&input)
             }
         }
