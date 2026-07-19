@@ -28,10 +28,10 @@ use serde::Serialize;
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
-mod chain;
-mod config;
-mod reporter;
-mod routes;
+pub(crate) mod chain;
+pub(crate) mod config;
+pub(crate) mod reporter;
+pub(crate) mod routes;
 
 use chain::ChainArg;
 use config::{
