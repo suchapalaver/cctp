@@ -15,7 +15,6 @@ use std::{
 use alloy::{
     primitives::{Address, TxHash, U256},
     providers::Provider,
-    signers::trezor::{HDPath, TrezorSigner},
 };
 use async_trait::async_trait;
 use cctp_rs::{
@@ -33,11 +32,12 @@ pub(crate) mod config;
 pub(crate) mod provider;
 pub(crate) mod reporter;
 pub(crate) mod routes;
+pub(crate) mod wallet;
 
 use chain::ChainArg;
 use config::{
     BridgeConfig, CliConfigService, ConfigService, ConfirmationPolicy, FastFeeCapRequest,
-    OutputMode, ReceivePolling, RelayMode, TransferRequest, WalletKind,
+    OutputMode, ReceivePolling, TransferRequest,
 };
 #[cfg(test)]
 use config::{ConfigValueSource, EnvSource, ManualFastFeeCap};
@@ -52,6 +52,9 @@ use reporter::{BridgeIntent, ConfiguredReporter, Reporter};
 use reporter::{JsonReportSink, JsonReporter};
 #[cfg(test)]
 use routes::RouteConfig;
+#[cfg(test)]
+use wallet::{RelaySignerRuntime, SourceSignerRuntime, WalletRole};
+use wallet::{ResolvedRelay, TrezorWalletService, WalletKind, WalletService};
 
 const DEFAULT_LOG_FILTER: &str = "info,cctp_rs=info";
 const DEFAULT_FAST_FEE_BUFFER_PERCENT: u32 = 20;
@@ -423,7 +426,7 @@ enum CompletionOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkflowRelay {
+pub(crate) enum WorkflowRelay {
     WaitForRelayer { fallback: WorkflowRelayFallback },
     SelfRelay { submitter: Address },
 }
@@ -904,199 +907,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WalletConfig {
-    Trezor { account: u32 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WalletRole {
-    SourceBurn,
-    DestinationRelay,
-}
-
-impl std::fmt::Display for WalletRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SourceBurn => f.write_str("source burn signer"),
-            Self::DestinationRelay => f.write_str("destination relay signer"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WalletDerivationPath {
-    TrezorLive { account: u32 },
-}
-
-impl WalletDerivationPath {
-    const fn trezor_live(account: u32) -> Self {
-        Self::TrezorLive { account }
-    }
-}
-
-impl std::fmt::Display for WalletDerivationPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TrezorLive { account } => write!(f, "m/44'/60'/{account}'/0/0"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WalletAccount {
-    role: WalletRole,
-    wallet: WalletConfig,
-    derivation_path: WalletDerivationPath,
-    chain: ChainArg,
-    address: Address,
-}
-
-impl WalletAccount {
-    fn chain_id(&self) -> u64 {
-        self.chain.chain_id()
-    }
-
-    const fn chain_label(&self) -> &'static str {
-        self.chain.display_label()
-    }
-}
-
-impl WalletConfig {
-    const fn from_kind(kind: WalletKind, trezor_account: u32) -> Self {
-        match kind {
-            WalletKind::Trezor => Self::Trezor {
-                account: trezor_account,
-            },
-        }
-    }
-
-    fn validate(self) -> Result<()> {
-        self.trezor_account_index().map(|_| ())
-    }
-
-    fn account_info(self, role: WalletRole, chain: ChainArg, address: Address) -> WalletAccount {
-        WalletAccount {
-            role,
-            wallet: self,
-            derivation_path: self.derivation_path(),
-            chain,
-            address,
-        }
-    }
-
-    fn trezor_account_index(self) -> Result<usize> {
-        match self {
-            Self::Trezor { account } => {
-                usize::try_from(account).wrap_err("Trezor account index is too large")
-            }
-        }
-    }
-
-    const fn derivation_path(self) -> WalletDerivationPath {
-        match self {
-            Self::Trezor { account } => WalletDerivationPath::trezor_live(account),
-        }
-    }
-
-    async fn trezor_signer(self, chain_id: u64) -> Result<TrezorSigner> {
-        match self {
-            Self::Trezor { .. } => {
-                let account_index = self.trezor_account_index()?;
-                TrezorSigner::new(HDPath::TrezorLive(account_index), Some(chain_id))
-                    .await
-                    .map_err(Into::into)
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for WalletConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Trezor { account } => write!(f, "trezor account {account}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelayConfig {
-    WaitForRelayer { fallback: RelayFallbackConfig },
-    SelfRelay { wallet: WalletConfig },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelayFallbackConfig {
-    SelfRelay { wallet: WalletConfig },
-}
-
-impl RelayConfig {
-    const fn from_mode(
-        mode: RelayMode,
-        kind: WalletKind,
-        relay_trezor_account: Option<u32>,
-        source_trezor_account: u32,
-    ) -> Self {
-        let wallet = relay_wallet_config(kind, relay_trezor_account, source_trezor_account);
-        match mode {
-            RelayMode::WaitForRelayer => Self::WaitForRelayer {
-                fallback: RelayFallbackConfig::SelfRelay { wallet },
-            },
-            RelayMode::SelfRelay => Self::SelfRelay { wallet },
-        }
-    }
-
-    const fn wallet(self) -> WalletConfig {
-        match self {
-            Self::WaitForRelayer {
-                fallback: RelayFallbackConfig::SelfRelay { wallet },
-            }
-            | Self::SelfRelay { wallet } => wallet,
-        }
-    }
-
-    fn validate(self) -> Result<()> {
-        self.wallet().validate()
-    }
-}
-
-const fn relay_wallet_config(
-    kind: WalletKind,
-    relay_trezor_account: Option<u32>,
-    source_trezor_account: u32,
-) -> WalletConfig {
-    match kind {
-        WalletKind::Trezor => WalletConfig::Trezor {
-            account: match relay_trezor_account {
-                Some(account) => account,
-                None => source_trezor_account,
-            },
-        },
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedRelayFallback {
-    SelfRelay { account: WalletAccount },
-}
-
-impl ResolvedRelayFallback {
-    const fn account(self) -> WalletAccount {
-        match self {
-            Self::SelfRelay { account } => account,
-        }
-    }
-
-    const fn workflow(self) -> WorkflowRelayFallback {
-        match self {
-            Self::SelfRelay { account } => WorkflowRelayFallback::SelfRelay {
-                submitter: account.address,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkflowRelayFallback {
+pub(crate) enum WorkflowRelayFallback {
     SelfRelay { submitter: Address },
 }
 
@@ -1104,163 +915,6 @@ impl WorkflowRelayFallback {
     const fn submitter(self) -> Address {
         match self {
             Self::SelfRelay { submitter } => submitter,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelayPolicyLabel {
-    WaitThenSelfRelay,
-    SelfRelay,
-}
-
-impl std::fmt::Display for RelayPolicyLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WaitThenSelfRelay => {
-                f.write_str("wait for any permissionless relayer, then self-relay fallback")
-            }
-            Self::SelfRelay => f.write_str("self-relay on destination chain"),
-        }
-    }
-}
-
-pub(crate) struct RelaySignerRuntime<S> {
-    signer: S,
-    account: WalletAccount,
-}
-
-pub(crate) struct SourceSignerRuntime<S> {
-    signer: S,
-    account: WalletAccount,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TrezorWalletService;
-
-#[async_trait(?Send)]
-pub(crate) trait WalletService {
-    type SourceSigner;
-    type RelaySigner;
-
-    async fn source_signer(
-        &self,
-        config: &BridgeConfig,
-    ) -> Result<SourceSignerRuntime<Self::SourceSigner>>;
-
-    async fn relay_signer(
-        &self,
-        config: &BridgeConfig,
-    ) -> Result<RelaySignerRuntime<Self::RelaySigner>>;
-}
-
-#[async_trait(?Send)]
-impl WalletService for TrezorWalletService {
-    type SourceSigner = TrezorSigner;
-    type RelaySigner = TrezorSigner;
-
-    async fn source_signer(
-        &self,
-        config: &BridgeConfig,
-    ) -> Result<SourceSignerRuntime<TrezorSigner>> {
-        let signer = config
-            .source_wallet
-            .trezor_signer(config.route.source_chain_id())
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to initialize Trezor signer for {}",
-                    config.route.source_label()
-                )
-            })?;
-        let address = signer.get_address().await.wrap_err_with(|| {
-            format!(
-                "failed to read {} address from Trezor",
-                config.route.source_label()
-            )
-        })?;
-        let account =
-            config
-                .source_wallet
-                .account_info(WalletRole::SourceBurn, config.route.from(), address);
-
-        Ok(SourceSignerRuntime { signer, account })
-    }
-
-    async fn relay_signer(
-        &self,
-        config: &BridgeConfig,
-    ) -> Result<RelaySignerRuntime<TrezorSigner>> {
-        let wallet = config.relay.wallet();
-
-        let signer = wallet
-            .trezor_signer(config.route.destination_chain_id())
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to initialize Trezor signer for {} self-relay",
-                    config.route.destination_label()
-                )
-            })?;
-        let address = signer.get_address().await.wrap_err_with(|| {
-            format!(
-                "failed to read {} relay address from Trezor",
-                config.route.destination_label()
-            )
-        })?;
-        let account = wallet.account_info(WalletRole::DestinationRelay, config.route.to(), address);
-
-        Ok(RelaySignerRuntime { signer, account })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedRelay {
-    WaitForRelayer { fallback: ResolvedRelayFallback },
-    SelfRelay { account: WalletAccount },
-}
-
-impl ResolvedRelay {
-    const fn from_config(config: RelayConfig, account: WalletAccount) -> Self {
-        match config {
-            RelayConfig::WaitForRelayer {
-                fallback: RelayFallbackConfig::SelfRelay { .. },
-            } => Self::WaitForRelayer {
-                fallback: ResolvedRelayFallback::SelfRelay { account },
-            },
-            RelayConfig::SelfRelay { .. } => Self::SelfRelay { account },
-        }
-    }
-
-    const fn mode(self) -> RelayMode {
-        match self {
-            Self::WaitForRelayer { .. } => RelayMode::WaitForRelayer,
-            Self::SelfRelay { .. } => RelayMode::SelfRelay,
-        }
-    }
-
-    const fn label(self) -> RelayPolicyLabel {
-        match self {
-            Self::WaitForRelayer { .. } => RelayPolicyLabel::WaitThenSelfRelay,
-            Self::SelfRelay { .. } => RelayPolicyLabel::SelfRelay,
-        }
-    }
-
-    const fn account(self) -> WalletAccount {
-        match self {
-            Self::WaitForRelayer { fallback } => fallback.account(),
-            Self::SelfRelay { account } => account,
-        }
-    }
-
-    const fn workflow_relay(self) -> WorkflowRelay {
-        match self {
-            Self::WaitForRelayer { fallback } => WorkflowRelay::WaitForRelayer {
-                fallback: fallback.workflow(),
-            },
-            Self::SelfRelay { account } => WorkflowRelay::SelfRelay {
-                submitter: account.address,
-            },
         }
     }
 }
@@ -1488,41 +1142,6 @@ mod tests {
         assert!(
             error.to_string().contains("below the current live"),
             "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn wallet_config_describes_trezor_derivation_and_chain_binding() {
-        let wallet = WalletConfig::Trezor { account: 3 };
-        let address = address!("0000000000000000000000000000000000000003");
-
-        let account = wallet.account_info(WalletRole::SourceBurn, ChainArg::Ethereum, address);
-
-        wallet.validate().expect("wallet config is valid");
-        assert_eq!(account.role, WalletRole::SourceBurn);
-        assert_eq!(account.wallet, wallet);
-        assert_eq!(
-            account.derivation_path,
-            WalletDerivationPath::TrezorLive { account: 3 }
-        );
-        assert_eq!(account.derivation_path.to_string(), "m/44'/60'/3'/0/0");
-        assert_eq!(account.chain_label(), "Ethereum mainnet");
-        assert_eq!(account.chain.named_chain(), NamedChain::Mainnet);
-        assert_eq!(account.chain, ChainArg::Ethereum);
-        assert_eq!(account.chain_id(), 1);
-        assert_eq!(account.address, address);
-    }
-
-    #[test]
-    fn relay_config_validates_without_device() {
-        let relay = RelayConfig::from_mode(RelayMode::SelfRelay, WalletKind::Trezor, Some(2), 0);
-
-        relay.validate().expect("relay config is valid");
-        assert_eq!(relay.wallet(), WalletConfig::Trezor { account: 2 });
-        assert!(
-            RelayConfig::from_mode(RelayMode::WaitForRelayer, WalletKind::Trezor, None, 0)
-                .validate()
-                .is_ok()
         );
     }
 
@@ -2315,32 +1934,6 @@ mod tests {
             ]
         );
         assert_eq!(workflow.runtime.last_mint_from, Some(relay_submitter));
-    }
-
-    #[test]
-    fn resolved_relay_uses_fallback_account_for_wait_mode() {
-        let account = WalletConfig::Trezor { account: 0 }.account_info(
-            WalletRole::DestinationRelay,
-            ChainArg::HyperEvm,
-            address!("0000000000000000000000000000000000000003"),
-        );
-        let relay = ResolvedRelay::from_config(
-            RelayConfig::WaitForRelayer {
-                fallback: RelayFallbackConfig::SelfRelay {
-                    wallet: WalletConfig::Trezor { account: 0 },
-                },
-            },
-            account,
-        );
-
-        assert_eq!(
-            relay.workflow_relay(),
-            WorkflowRelay::WaitForRelayer {
-                fallback: WorkflowRelayFallback::SelfRelay {
-                    submitter: account.address
-                }
-            }
-        );
     }
 
     const MOCK_MESSAGE: &[u8] = &[0xaa, 0xbb, 0xcc];

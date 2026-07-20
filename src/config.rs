@@ -11,30 +11,16 @@ use eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::BridgeArgs;
 use crate::chain::ChainArg;
 use crate::provider::{CHAIN_ENDPOINT_CATALOG, ResolvedChainRpcEndpoints, RpcEndpoints};
 use crate::routes::{ROUTE_CATALOG, RouteConfig};
-use crate::{BridgeArgs, RelayConfig, WalletConfig};
+use crate::wallet::{RelayConfig, WalletConfig, WalletKind};
 
 pub(crate) const ETHEREUM_RPC_ENV: &str = "ETHEREUM_RPC_URL";
 pub(crate) const HYPEREVM_RPC_ENV: &str = "HYPEREVM_RPC_URL";
 pub(crate) const ETHEREUM_SEPOLIA_RPC_ENV: &str = "ETHEREUM_SEPOLIA_RPC_URL";
 pub(crate) const BASE_SEPOLIA_RPC_ENV: &str = "BASE_SEPOLIA_RPC_URL";
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum WalletKind {
-    #[serde(rename = "trezor")]
-    Trezor,
-}
-
-impl std::fmt::Display for WalletKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Trezor => f.write_str("trezor"),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -756,8 +742,9 @@ fn transfer_request(fast: bool, max_fee_usdc: Option<&Sourced<String>>) -> Resul
 )]
 mod tests {
     use super::*;
+    use crate::BridgeArgs;
     use crate::routes::ETHEREUM_SEPOLIA_USDC;
-    use crate::{BridgeArgs, RelayConfig, RelayFallbackConfig, WalletConfig};
+    use crate::wallet::{RelayConfig, RelayFallbackConfig, WalletConfig};
     use alloy::primitives::{U256, address};
     use alloy_chains::NamedChain;
     use std::{
