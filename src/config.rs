@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::chain::ChainArg;
+use crate::provider::{CHAIN_ENDPOINT_CATALOG, ResolvedChainRpcEndpoints, RpcEndpoints};
 use crate::routes::{ROUTE_CATALOG, RouteConfig};
 use crate::{BridgeArgs, RelayConfig, WalletConfig};
 
@@ -241,15 +242,15 @@ where
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BridgeConfigFile {
+pub(crate) struct BridgeConfigFile {
     from: Option<ChainArg>,
     to: Option<ChainArg>,
     amount: Option<String>,
     recipient: Option<Address>,
-    ethereum_rpc: Option<String>,
-    hyperevm_rpc: Option<String>,
-    ethereum_sepolia_rpc: Option<String>,
-    base_sepolia_rpc: Option<String>,
+    pub(crate) ethereum_rpc: Option<String>,
+    pub(crate) hyperevm_rpc: Option<String>,
+    pub(crate) ethereum_sepolia_rpc: Option<String>,
+    pub(crate) base_sepolia_rpc: Option<String>,
     wallet: Option<WalletKind>,
     trezor_account: Option<u32>,
     relay_trezor_account: Option<u32>,
@@ -305,6 +306,14 @@ impl<T> Sourced<T> {
     const fn new(value: T, source: ConfigValueSource) -> Self {
         Self { value, source }
     }
+
+    pub(crate) const fn source(&self) -> ConfigValueSource {
+        self.source
+    }
+
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
 }
 
 fn sourced_cli_file_default<T>(
@@ -351,7 +360,7 @@ fn sourced_required_cli_file<T>(
     sourced_optional_cli_file(cli, cli_flag, file, file_field).ok_or_else(|| eyre!(missing_message))
 }
 
-fn sourced_required_cli_env_file(
+pub(crate) fn sourced_required_cli_env_file(
     cli: Option<String>,
     cli_flag: &'static str,
     env: Option<String>,
@@ -409,7 +418,7 @@ pub(crate) struct RpcEndpointsProvenance {
 }
 
 impl RpcEndpointsProvenance {
-    fn from_resolved(endpoints: &ResolvedChainRpcEndpoints) -> Self {
+    pub(crate) fn from_resolved(endpoints: &ResolvedChainRpcEndpoints) -> Self {
         Self {
             source: RpcEndpointProvenance::from_url(
                 endpoints.source.config_source,
@@ -581,161 +590,6 @@ pub(crate) struct BridgeConfig {
     pub(crate) confirmation: ConfirmationPolicy,
     pub(crate) output: OutputMode,
     pub(crate) provenance: BridgeConfigProvenance,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RpcEndpoints {
-    pub(crate) source: Url,
-    pub(crate) destination: Url,
-}
-
-impl RpcEndpoints {
-    fn from_resolved(endpoints: &ResolvedChainRpcEndpoints) -> Self {
-        Self {
-            source: endpoints.source.url.clone(),
-            destination: endpoints.destination.url.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ChainEndpointCatalog;
-
-const CHAIN_ENDPOINT_CATALOG: ChainEndpointCatalog = ChainEndpointCatalog;
-
-const CHAIN_ENDPOINTS: &[ChainEndpoint] = &[
-    ChainEndpoint {
-        chain: ChainArg::Ethereum,
-        cli_flag: "--ethereum-rpc",
-        env_var: ETHEREUM_RPC_ENV,
-        config_field: "ethereum_rpc",
-        missing_message: "missing Ethereum RPC URL; set --ethereum-rpc, ETHEREUM_RPC_URL, or ethereum_rpc in the config file",
-        parse_error: "failed to parse --ethereum-rpc as a URL",
-    },
-    ChainEndpoint {
-        chain: ChainArg::HyperEvm,
-        cli_flag: "--hyperevm-rpc",
-        env_var: HYPEREVM_RPC_ENV,
-        config_field: "hyperevm_rpc",
-        missing_message: "missing HyperEVM RPC URL; set --hyperevm-rpc, HYPEREVM_RPC_URL, or hyperevm_rpc in the config file",
-        parse_error: "failed to parse --hyperevm-rpc as a URL",
-    },
-    ChainEndpoint {
-        chain: ChainArg::EthereumSepolia,
-        cli_flag: "--ethereum-sepolia-rpc",
-        env_var: ETHEREUM_SEPOLIA_RPC_ENV,
-        config_field: "ethereum_sepolia_rpc",
-        missing_message: "missing Ethereum Sepolia RPC URL; set --ethereum-sepolia-rpc, ETHEREUM_SEPOLIA_RPC_URL, or ethereum_sepolia_rpc in the config file",
-        parse_error: "failed to parse --ethereum-sepolia-rpc as a URL",
-    },
-    ChainEndpoint {
-        chain: ChainArg::BaseSepolia,
-        cli_flag: "--base-sepolia-rpc",
-        env_var: BASE_SEPOLIA_RPC_ENV,
-        config_field: "base_sepolia_rpc",
-        missing_message: "missing Base Sepolia RPC URL; set --base-sepolia-rpc, BASE_SEPOLIA_RPC_URL, or base_sepolia_rpc in the config file",
-        parse_error: "failed to parse --base-sepolia-rpc as a URL",
-    },
-];
-
-impl ChainEndpointCatalog {
-    fn resolve_route<E>(
-        &self,
-        route: &RouteConfig,
-        args: &BridgeArgs,
-        file: &BridgeConfigFile,
-        env: &E,
-    ) -> Result<ResolvedChainRpcEndpoints>
-    where
-        E: EnvSource,
-    {
-        Ok(ResolvedChainRpcEndpoints {
-            source: self.resolve_endpoint(route.from(), args, file, env)?,
-            destination: self.resolve_endpoint(route.to(), args, file, env)?,
-        })
-    }
-
-    fn resolve_endpoint<E>(
-        &self,
-        chain: ChainArg,
-        args: &BridgeArgs,
-        file: &BridgeConfigFile,
-        env: &E,
-    ) -> Result<ResolvedChainRpcEndpoint>
-    where
-        E: EnvSource,
-    {
-        let endpoint = self.endpoint(chain)?;
-        let raw_endpoint = sourced_required_cli_env_file(
-            endpoint.cli_value(args),
-            endpoint.cli_flag,
-            env.get(endpoint.env_var),
-            endpoint.env_var,
-            endpoint.file_value(file),
-            endpoint.config_field,
-            endpoint.missing_message,
-        )?;
-        let url = raw_endpoint.value.parse().wrap_err(endpoint.parse_error)?;
-
-        Ok(ResolvedChainRpcEndpoint {
-            url,
-            config_source: raw_endpoint.source,
-        })
-    }
-
-    fn endpoint(&self, chain: ChainArg) -> Result<ChainEndpoint> {
-        self.endpoints()
-            .iter()
-            .copied()
-            .find(|endpoint| endpoint.chain == chain)
-            .ok_or_else(|| eyre!("missing RPC endpoint catalog entry for {chain}"))
-    }
-
-    const fn endpoints(&self) -> &'static [ChainEndpoint] {
-        CHAIN_ENDPOINTS
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChainEndpoint {
-    chain: ChainArg,
-    cli_flag: &'static str,
-    env_var: &'static str,
-    config_field: &'static str,
-    missing_message: &'static str,
-    parse_error: &'static str,
-}
-
-impl ChainEndpoint {
-    fn cli_value(self, args: &BridgeArgs) -> Option<String> {
-        match self.chain {
-            ChainArg::Ethereum => args.ethereum_rpc.clone(),
-            ChainArg::HyperEvm => args.hyperevm_rpc.clone(),
-            ChainArg::EthereumSepolia => args.ethereum_sepolia_rpc.clone(),
-            ChainArg::BaseSepolia => args.base_sepolia_rpc.clone(),
-        }
-    }
-
-    fn file_value(self, file: &BridgeConfigFile) -> Option<String> {
-        match self.chain {
-            ChainArg::Ethereum => file.ethereum_rpc.clone(),
-            ChainArg::HyperEvm => file.hyperevm_rpc.clone(),
-            ChainArg::EthereumSepolia => file.ethereum_sepolia_rpc.clone(),
-            ChainArg::BaseSepolia => file.base_sepolia_rpc.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedChainRpcEndpoints {
-    source: ResolvedChainRpcEndpoint,
-    destination: ResolvedChainRpcEndpoint,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedChainRpcEndpoint {
-    url: Url,
-    config_source: ConfigValueSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -996,18 +850,6 @@ mod tests {
         }
     }
 
-    fn supported_route_config() -> RouteConfig {
-        ROUTE_CATALOG
-            .resolve(ChainArg::Ethereum, ChainArg::HyperEvm)
-            .expect("mainnet route should be supported")
-    }
-
-    fn testnet_route_config() -> RouteConfig {
-        ROUTE_CATALOG
-            .resolve(ChainArg::EthereumSepolia, ChainArg::BaseSepolia)
-            .expect("testnet route should be supported")
-    }
-
     #[test]
     fn config_service_builds_bridge_config() {
         let config = empty_service()
@@ -1117,168 +959,6 @@ mod tests {
         assert_eq!(
             config.provenance.rpc.destination.source,
             ConfigValueSource::CliFlag("--base-sepolia-rpc")
-        );
-    }
-
-    #[test]
-    fn endpoint_catalog_resolves_route_endpoint_roles_and_provenance() {
-        let route = supported_route_config();
-        let mut args = empty_args();
-        args.ethereum_rpc = Some("https://source.example".to_owned());
-        args.hyperevm_rpc = Some("https://destination.example".to_owned());
-
-        let endpoints = CHAIN_ENDPOINT_CATALOG
-            .resolve_route(
-                &route,
-                &args,
-                &BridgeConfigFile::default(),
-                &TestEnv::default(),
-            )
-            .expect("endpoint catalog should resolve current route");
-        let rpc = RpcEndpoints::from_resolved(&endpoints);
-        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
-
-        assert_eq!(rpc.source.as_str(), "https://source.example/");
-        assert_eq!(rpc.destination.as_str(), "https://destination.example/");
-        assert_eq!(
-            provenance.source.source,
-            ConfigValueSource::CliFlag("--ethereum-rpc")
-        );
-        assert_eq!(
-            provenance.destination.source,
-            ConfigValueSource::CliFlag("--hyperevm-rpc")
-        );
-    }
-
-    #[test]
-    fn endpoint_catalog_resolves_testnet_endpoint_roles_and_provenance() {
-        let route = testnet_route_config();
-        let mut args = empty_args();
-        args.ethereum_sepolia_rpc = Some("https://source-testnet.example".to_owned());
-        args.base_sepolia_rpc = Some("https://destination-testnet.example".to_owned());
-
-        let endpoints = CHAIN_ENDPOINT_CATALOG
-            .resolve_route(
-                &route,
-                &args,
-                &BridgeConfigFile::default(),
-                &TestEnv::default(),
-            )
-            .expect("endpoint catalog should resolve testnet route");
-        let rpc = RpcEndpoints::from_resolved(&endpoints);
-        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
-
-        assert_eq!(rpc.source.as_str(), "https://source-testnet.example/");
-        assert_eq!(
-            rpc.destination.as_str(),
-            "https://destination-testnet.example/"
-        );
-        assert_eq!(
-            provenance.source.source,
-            ConfigValueSource::CliFlag("--ethereum-sepolia-rpc")
-        );
-        assert_eq!(
-            provenance.destination.source,
-            ConfigValueSource::CliFlag("--base-sepolia-rpc")
-        );
-    }
-
-    #[test]
-    fn endpoint_catalog_maps_testnet_sources_by_chain_after_precedence() {
-        let route = testnet_route_config();
-        let mut args = empty_args();
-        args.base_sepolia_rpc = Some("https://cli.base-sepolia.example".to_owned());
-        let file = BridgeConfigFile {
-            ethereum_sepolia_rpc: Some("https://file.ethereum-sepolia.example".to_owned()),
-            base_sepolia_rpc: Some("https://file.base-sepolia.example".to_owned()),
-            ..BridgeConfigFile::default()
-        };
-        let env = TestEnv(HashMap::from([(
-            ETHEREUM_SEPOLIA_RPC_ENV.to_owned(),
-            "https://env.ethereum-sepolia.example".to_owned(),
-        )]));
-
-        let endpoints = CHAIN_ENDPOINT_CATALOG
-            .resolve_route(&route, &args, &file, &env)
-            .expect("endpoint catalog should apply per-chain testnet precedence");
-        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
-
-        assert_eq!(
-            endpoints.source.url.as_str(),
-            "https://env.ethereum-sepolia.example/"
-        );
-        assert_eq!(
-            endpoints.destination.url.as_str(),
-            "https://cli.base-sepolia.example/"
-        );
-        assert_eq!(
-            provenance.source.source,
-            ConfigValueSource::EnvVar(ETHEREUM_SEPOLIA_RPC_ENV)
-        );
-        assert_eq!(
-            provenance.destination.source,
-            ConfigValueSource::CliFlag("--base-sepolia-rpc")
-        );
-    }
-
-    #[test]
-    fn endpoint_catalog_maps_sources_by_chain_after_precedence() {
-        let route = supported_route_config();
-        let mut args = empty_args();
-        args.hyperevm_rpc = Some("https://cli.hyperevm.example".to_owned());
-        let file = BridgeConfigFile {
-            ethereum_rpc: Some("https://file.ethereum.example".to_owned()),
-            hyperevm_rpc: Some("https://file.hyperevm.example".to_owned()),
-            ..BridgeConfigFile::default()
-        };
-        let env = TestEnv(HashMap::from([(
-            ETHEREUM_RPC_ENV.to_owned(),
-            "https://env.ethereum.example".to_owned(),
-        )]));
-
-        let endpoints = CHAIN_ENDPOINT_CATALOG
-            .resolve_route(&route, &args, &file, &env)
-            .expect("endpoint catalog should apply per-chain precedence");
-        let provenance = RpcEndpointsProvenance::from_resolved(&endpoints);
-
-        assert_eq!(
-            endpoints.source.url.as_str(),
-            "https://env.ethereum.example/"
-        );
-        assert_eq!(
-            endpoints.destination.url.as_str(),
-            "https://cli.hyperevm.example/"
-        );
-        assert_eq!(
-            provenance.source.source,
-            ConfigValueSource::EnvVar(ETHEREUM_RPC_ENV)
-        );
-        assert_eq!(
-            provenance.destination.source,
-            ConfigValueSource::CliFlag("--hyperevm-rpc")
-        );
-    }
-
-    #[test]
-    fn endpoint_catalog_reports_chain_specific_parse_error() {
-        let route = supported_route_config();
-        let mut args = empty_args();
-        args.ethereum_rpc = Some("not a url".to_owned());
-        args.hyperevm_rpc = Some("https://destination.example".to_owned());
-
-        let error = CHAIN_ENDPOINT_CATALOG
-            .resolve_route(
-                &route,
-                &args,
-                &BridgeConfigFile::default(),
-                &TestEnv::default(),
-            )
-            .expect_err("invalid source endpoint should be rejected");
-        let message = error.to_string();
-
-        assert!(
-            message.contains("failed to parse --ethereum-rpc as a URL"),
-            "unexpected error: {message}"
         );
     }
 
