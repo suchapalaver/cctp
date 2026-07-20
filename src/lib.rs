@@ -177,6 +177,14 @@ struct BridgeArgs {
 }
 
 /// Runs the `cctp` command-line application with process arguments and environment.
+///
+/// # Errors
+///
+/// Returns an error when local setup fails, such as an unreadable `.env` file
+/// or an already-installed logging subscriber. Bridge commands also return
+/// errors when configuration is incomplete, route or provider validation fails,
+/// the operator rejects the bridge intent, wallet setup fails, or CCTP
+/// approval, burn, attestation, receive polling, or minting does not complete.
 pub async fn run() -> Result<()> {
     load_dotenv()?;
 
@@ -185,7 +193,9 @@ pub async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(io::stderr)
-        .init();
+        .try_init()
+        .map_err(|error| eyre!(error))
+        .wrap_err("failed to initialize logging subscriber")?;
 
     let cli = Cli::parse();
     match cli.command {
