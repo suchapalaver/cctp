@@ -1,0 +1,27 @@
+name: Check PR title
+
+on:
+  pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
+
+jobs:
+  check:
+    name: Check PR title
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate Conventional Commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|release|revert|style|test)(\([a-z0-9._/-]+\))?!?: .+$'
+
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "::error::PR title must follow Conventional Commits, such as 'ci: enforce checks' or 'refactor(config): split service'."
+            exit 1
+          fi
