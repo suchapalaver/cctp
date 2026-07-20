@@ -26,6 +26,8 @@ unreachable_pub = "deny"
 unused_results = "deny"
 
 [lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 expect_used = "deny"
 let_underscore_must_use = "deny"
 let_underscore_untyped = "deny"

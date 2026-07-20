@@ -896,7 +896,7 @@ fn transfer_request(fast: bool, max_fee_usdc: Option<&Sourced<String>>) -> Resul
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     reason = "tests use explicit expect messages to assert setup and validation invariants"
 )]
