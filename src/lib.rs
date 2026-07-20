@@ -1525,7 +1525,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     reason = "tests use explicit expect messages to assert setup and validation invariants"
 )]
