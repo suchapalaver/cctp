@@ -17,6 +17,17 @@ Use `nix develop -c cargo fmt` before committing Rust changes.
 ## Commit And Release Policy
 
 - Commits and release tags must be signed.
+- `main` is protected. Do not push directly to it; use pull requests. Force
+  pushes and branch deletion are disabled on protected branches.
+- Pull requests targeting `main` must pass `Check crate` and `Check PR title`
+  before merge.
+- Pull request titles and commit subjects must follow Conventional Commits, for
+  example `ci: enforce checks` or `refactor(config): split service`.
+- Merge pull requests with squash merge only. Use the PR title as the squash
+  commit subject so `main` keeps Conventional Commit history.
+- Resolve conversations before merging. Reviews are not required for this solo
+  repository policy; if required reviews are enabled later, dismiss stale
+  approvals on new pushes.
 - Do not push unsigned commits.
 - Before handing off a pushed commit, verify local GPG status with
   `git log --show-signature --oneline -1` and GitHub verification with
