@@ -11,11 +11,11 @@ use crate::config::{
     OutputMode, RecipientProvenance, RelayMode, RelayWalletProvenance, RouteConfigProvenance,
     RpcEndpointProvenance,
 };
+use crate::provider::{BridgeContracts, ProviderChainCheck, ProviderValidation};
 use crate::routes::RouteConfig;
 use crate::{
-    ApprovalOutcome, BridgeContracts, BridgeOutcome, CompletionOutcome, FastFeeCapSource,
-    ProviderChainCheck, ProviderValidation, RelayPolicyLabel, ResolvedRelay, ResolvedTransferMode,
-    WalletAccount, mode_label,
+    ApprovalOutcome, BridgeOutcome, CompletionOutcome, FastFeeCapSource, RelayPolicyLabel,
+    ResolvedRelay, ResolvedTransferMode, WalletAccount, mode_label,
 };
 
 #[derive(Clone, Debug)]

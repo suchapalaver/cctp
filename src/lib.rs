@@ -14,7 +14,7 @@ use std::{
 
 use alloy::{
     primitives::{Address, TxHash, U256},
-    providers::{DynProvider, Provider, ProviderBuilder},
+    providers::Provider,
     signers::trezor::{HDPath, TrezorSigner},
 };
 use async_trait::async_trait;
@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 pub(crate) mod chain;
 pub(crate) mod config;
+pub(crate) mod provider;
 pub(crate) mod reporter;
 pub(crate) mod routes;
 
@@ -40,9 +41,16 @@ use config::{
 };
 #[cfg(test)]
 use config::{ConfigValueSource, EnvSource, ManualFastFeeCap};
+use provider::{
+    AlloyProviderService, AlloyProviderValidationService, ProviderService,
+    ProviderValidationService,
+};
+#[cfg(test)]
+use provider::{BridgeContracts, ProviderValidation};
 use reporter::{BridgeIntent, ConfiguredReporter, Reporter};
 #[cfg(test)]
 use reporter::{JsonReportSink, JsonReporter};
+#[cfg(test)]
 use routes::RouteConfig;
 
 const DEFAULT_LOG_FILTER: &str = "info,cctp_rs=info";
@@ -561,7 +569,7 @@ where
 }
 
 #[async_trait(?Send)]
-trait BridgeRuntime {
+pub(crate) trait BridgeRuntime {
     fn token_messenger_v2_contract(&self) -> Result<Address>;
 
     fn destination_domain_id(&self) -> Result<DomainId>;
@@ -609,7 +617,7 @@ trait BridgeRuntime {
     ) -> Result<()>;
 }
 
-struct CctpBridgeRuntime<P>
+pub(crate) struct CctpBridgeRuntime<P>
 where
     P: Provider + Clone,
 {
@@ -622,7 +630,11 @@ impl<P> CctpBridgeRuntime<P>
 where
     P: Provider + Clone,
 {
-    const fn new(bridge: CctpV2Bridge<P>, source_provider: P, destination_provider: P) -> Self {
+    pub(crate) const fn new(
+        bridge: CctpV2Bridge<P>,
+        source_provider: P,
+        destination_provider: P,
+    ) -> Self {
         Self {
             bridge,
             source_provider,
@@ -1113,21 +1125,21 @@ impl std::fmt::Display for RelayPolicyLabel {
     }
 }
 
-struct RelaySignerRuntime<S> {
+pub(crate) struct RelaySignerRuntime<S> {
     signer: S,
     account: WalletAccount,
 }
 
-struct SourceSignerRuntime<S> {
+pub(crate) struct SourceSignerRuntime<S> {
     signer: S,
     account: WalletAccount,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct TrezorWalletService;
+pub(crate) struct TrezorWalletService;
 
 #[async_trait(?Send)]
-trait WalletService {
+pub(crate) trait WalletService {
     type SourceSigner;
     type RelaySigner;
 
@@ -1199,261 +1211,6 @@ impl WalletService for TrezorWalletService {
         let account = wallet.account_info(WalletRole::DestinationRelay, config.route.to(), address);
 
         Ok(RelaySignerRuntime { signer, account })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BridgeProviders {
-    source: DynProvider,
-    destination: DynProvider,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct AlloyProviderService;
-
-trait ProviderService<W>
-where
-    W: WalletService,
-{
-    type Providers;
-    type Bridge;
-    type Runtime: BridgeRuntime;
-
-    fn read_only_providers(&self, config: &BridgeConfig) -> Self::Providers;
-
-    fn bridge_providers(
-        &self,
-        config: &BridgeConfig,
-        source_signer: W::SourceSigner,
-        relay_signer: RelaySignerRuntime<W::RelaySigner>,
-    ) -> Self::Providers;
-
-    fn bridge(
-        &self,
-        config: &BridgeConfig,
-        providers: &Self::Providers,
-        recipient: Address,
-        transfer_mode: TransferMode,
-    ) -> Self::Bridge;
-
-    fn contracts(&self, bridge: &Self::Bridge) -> Result<BridgeContracts>;
-
-    fn runtime(&self, bridge: Self::Bridge, providers: Self::Providers) -> Self::Runtime;
-}
-
-impl ProviderService<TrezorWalletService> for AlloyProviderService {
-    type Providers = BridgeProviders;
-    type Bridge = CctpV2Bridge<DynProvider>;
-    type Runtime = CctpBridgeRuntime<DynProvider>;
-
-    fn read_only_providers(&self, config: &BridgeConfig) -> BridgeProviders {
-        BridgeProviders {
-            source: ProviderBuilder::new()
-                .connect_http(config.rpc.source.clone())
-                .erased(),
-            destination: ProviderBuilder::new()
-                .connect_http(config.rpc.destination.clone())
-                .erased(),
-        }
-    }
-
-    fn bridge_providers(
-        &self,
-        config: &BridgeConfig,
-        source_signer: TrezorSigner,
-        relay_signer: RelaySignerRuntime<TrezorSigner>,
-    ) -> BridgeProviders {
-        let source = ProviderBuilder::new()
-            .wallet(source_signer)
-            .connect_http(config.rpc.source.clone())
-            .erased();
-        let destination = ProviderBuilder::new()
-            .wallet(relay_signer.signer)
-            .connect_http(config.rpc.destination.clone())
-            .erased();
-
-        BridgeProviders {
-            source,
-            destination,
-        }
-    }
-
-    fn bridge(
-        &self,
-        config: &BridgeConfig,
-        providers: &BridgeProviders,
-        recipient: Address,
-        transfer_mode: TransferMode,
-    ) -> CctpV2Bridge<DynProvider> {
-        CctpV2Bridge::from_route(config.route.cctp_route())
-            .source_provider(providers.source.clone())
-            .destination_provider(providers.destination.clone())
-            .recipient(recipient)
-            .transfer_mode(transfer_mode)
-            .build()
-    }
-
-    fn contracts(&self, bridge: &CctpV2Bridge<DynProvider>) -> Result<BridgeContracts> {
-        BridgeContracts::from_bridge(bridge)
-    }
-
-    fn runtime(
-        &self,
-        bridge: CctpV2Bridge<DynProvider>,
-        providers: BridgeProviders,
-    ) -> CctpBridgeRuntime<DynProvider> {
-        CctpBridgeRuntime::new(bridge, providers.source, providers.destination)
-    }
-}
-
-#[async_trait(?Send)]
-trait ProviderValidationService<P> {
-    async fn validate(&self, config: &BridgeConfig, providers: &P) -> Result<ProviderValidation>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct AlloyProviderValidationService;
-
-#[async_trait(?Send)]
-impl ProviderValidationService<BridgeProviders> for AlloyProviderValidationService {
-    async fn validate(
-        &self,
-        config: &BridgeConfig,
-        providers: &BridgeProviders,
-    ) -> Result<ProviderValidation> {
-        let source_chain_id = providers
-            .source
-            .get_chain_id()
-            .await
-            .wrap_err("failed to read source RPC chain ID")?;
-        let destination_chain_id = providers
-            .destination
-            .get_chain_id()
-            .await
-            .wrap_err("failed to read destination RPC chain ID")?;
-
-        ProviderValidation::new(config.route, source_chain_id, destination_chain_id)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderValidation {
-    source: ProviderChainCheck,
-    destination: ProviderChainCheck,
-}
-
-impl ProviderValidation {
-    fn new(
-        route: RouteConfig,
-        source_actual_chain_id: u64,
-        destination_actual_chain_id: u64,
-    ) -> Result<Self> {
-        Ok(Self {
-            source: ProviderChainCheck::validate(
-                route,
-                ProviderEndpointRole::Source,
-                ExpectedProviderChain::new(route.from()),
-                source_actual_chain_id,
-            )?,
-            destination: ProviderChainCheck::validate(
-                route,
-                ProviderEndpointRole::Destination,
-                ExpectedProviderChain::new(route.to()),
-                destination_actual_chain_id,
-            )?,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderChainCheck {
-    role: ProviderEndpointRole,
-    expected: ExpectedProviderChain,
-    actual_chain_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExpectedProviderChain {
-    chain: ChainArg,
-}
-
-impl ExpectedProviderChain {
-    const fn new(chain: ChainArg) -> Self {
-        Self { chain }
-    }
-
-    const fn display_label(&self) -> &'static str {
-        self.chain.display_label()
-    }
-
-    fn chain_id(&self) -> u64 {
-        self.chain.chain_id()
-    }
-}
-
-impl ProviderChainCheck {
-    fn validate(
-        route: RouteConfig,
-        role: ProviderEndpointRole,
-        expected: ExpectedProviderChain,
-        actual_chain_id: u64,
-    ) -> Result<Self> {
-        let expected_chain_id = expected.chain_id();
-        if actual_chain_id != expected_chain_id {
-            let chain_label = expected.display_label();
-            bail!(
-                "{} chain ID mismatch for route {route}: expected {expected_chain_id} ({chain_label}), got {actual_chain_id}",
-                role.error_label()
-            );
-        }
-
-        Ok(Self {
-            role,
-            expected,
-            actual_chain_id,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderEndpointRole {
-    Source,
-    Destination,
-}
-
-impl ProviderEndpointRole {
-    const fn error_label(self) -> &'static str {
-        match self {
-            Self::Source => "source RPC",
-            Self::Destination => "destination RPC",
-        }
-    }
-
-    const fn report_label(self) -> &'static str {
-        match self {
-            Self::Source => "Source RPC",
-            Self::Destination => "Destination RPC",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BridgeContracts {
-    token_messenger: Address,
-    message_transmitter: Address,
-    destination_domain: DomainId,
-}
-
-impl BridgeContracts {
-    fn from_bridge<P>(bridge: &CctpV2Bridge<P>) -> Result<Self>
-    where
-        P: Provider + Clone,
-    {
-        Ok(Self {
-            token_messenger: bridge.token_messenger_v2_contract()?,
-            message_transmitter: bridge.message_transmitter_v2_contract()?,
-            destination_domain: bridge.destination_domain_id()?,
-        })
     }
 }
 
@@ -1767,127 +1524,6 @@ mod tests {
                 .validate()
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn provider_validation_accepts_expected_chain_ids() {
-        let route = supported_route_config();
-
-        let validation =
-            ProviderValidation::new(route, route.source_chain_id(), route.destination_chain_id())
-                .expect("chain IDs match");
-
-        assert_eq!(
-            validation.source,
-            ProviderChainCheck {
-                role: ProviderEndpointRole::Source,
-                expected: ExpectedProviderChain::new(ChainArg::Ethereum),
-                actual_chain_id: route.source_chain_id()
-            }
-        );
-        assert_eq!(
-            validation.destination,
-            ProviderChainCheck {
-                role: ProviderEndpointRole::Destination,
-                expected: ExpectedProviderChain::new(ChainArg::HyperEvm),
-                actual_chain_id: route.destination_chain_id()
-            }
-        );
-    }
-
-    #[test]
-    fn provider_validation_accepts_testnet_chain_ids() {
-        let route = testnet_route_config();
-
-        let validation =
-            ProviderValidation::new(route, route.source_chain_id(), route.destination_chain_id())
-                .expect("testnet chain IDs match");
-
-        assert_eq!(
-            validation.source,
-            ProviderChainCheck {
-                role: ProviderEndpointRole::Source,
-                expected: ExpectedProviderChain::new(ChainArg::EthereumSepolia),
-                actual_chain_id: 11_155_111
-            }
-        );
-        assert_eq!(
-            validation.destination,
-            ProviderChainCheck {
-                role: ProviderEndpointRole::Destination,
-                expected: ExpectedProviderChain::new(ChainArg::BaseSepolia),
-                actual_chain_id: 84_532
-            }
-        );
-    }
-
-    #[test]
-    fn provider_validation_rejects_source_chain_mismatch_with_route_context() {
-        let route = supported_route_config();
-
-        let error = ProviderValidation::new(route, 31_337, route.destination_chain_id())
-            .expect_err("source mismatch is invalid");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("source RPC"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("Ethereum mainnet -> HyperEVM"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("expected 1"),
-            "unexpected error: {message}"
-        );
-        assert!(message.contains("got 31337"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn provider_validation_rejects_mainnet_rpc_for_testnet_route_context() {
-        let route = testnet_route_config();
-
-        let error = ProviderValidation::new(route, 1, route.destination_chain_id())
-            .expect_err("mainnet RPC on testnet route is invalid");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("source RPC"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("Ethereum Sepolia testnet -> Base Sepolia testnet"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("expected 11155111"),
-            "unexpected error: {message}"
-        );
-        assert!(message.contains("got 1"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn provider_validation_rejects_destination_chain_mismatch_with_route_context() {
-        let route = supported_route_config();
-
-        let error = ProviderValidation::new(route, route.source_chain_id(), 31_337)
-            .expect_err("destination mismatch is invalid");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("destination RPC"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("Ethereum mainnet -> HyperEVM"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains(&format!("expected {}", route.destination_chain_id())),
-            "unexpected error: {message}"
-        );
-        assert!(message.contains("got 31337"), "unexpected error: {message}");
     }
 
     #[test]
