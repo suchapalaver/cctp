@@ -13,9 +13,10 @@ use crate::config::{
 };
 use crate::provider::{BridgeContracts, ProviderChainCheck, ProviderValidation};
 use crate::routes::RouteConfig;
+use crate::wallet::{RelayPolicyLabel, ResolvedRelay, WalletAccount};
 use crate::{
-    ApprovalOutcome, BridgeOutcome, CompletionOutcome, FastFeeCapSource, RelayPolicyLabel,
-    ResolvedRelay, ResolvedTransferMode, WalletAccount, mode_label,
+    ApprovalOutcome, BridgeOutcome, CompletionOutcome, FastFeeCapSource, ResolvedTransferMode,
+    mode_label,
 };
 
 #[derive(Clone, Debug)]
