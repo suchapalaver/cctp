@@ -797,7 +797,7 @@ fn validate_confirmation_input(input: &str) -> Result<()> {
     if input.trim() == "CONFIRM" {
         Ok(())
     } else {
-        bail!("bridge intent was not confirmed")
+        bail!("bridge intent was not confirmed");
     }
 }
 
@@ -956,7 +956,7 @@ where
         sleep(interval).await;
     }
 
-    bail!("{label} transaction {tx_hash} was not confirmed before timeout")
+    bail!("{label} transaction {tx_hash} was not confirmed before timeout");
 }
 
 #[cfg(test)]
@@ -2107,7 +2107,7 @@ mod tests {
             if self.receive_completes {
                 Ok(())
             } else {
-                bail!("destination receive status was not observed")
+                bail!("destination receive status was not observed");
             }
         }
 
