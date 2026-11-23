@@ -341,7 +341,7 @@ where
         }
 
         self.approval_service
-            .confirm(&intent, config.confirmation)?;
+            .confirm(intent.amount, config.confirmation)?;
         self.reporter.report_workflow_start()?;
 
         let runtime = self.provider_service.runtime(bridge, providers);
@@ -755,7 +755,7 @@ where
 trait IntentApprovalService {
     fn confirm(
         &self,
-        intent: &BridgeIntent,
+        amount: UsdcAmount,
         policy: ConfirmationPolicy,
     ) -> Result<(), ConfirmationError>;
 }
@@ -799,22 +799,20 @@ struct TerminalIntentApprovalService;
 impl IntentApprovalService for TerminalIntentApprovalService {
     fn confirm(
         &self,
-        intent: &BridgeIntent,
+        amount: UsdcAmount,
         policy: ConfirmationPolicy,
     ) -> Result<(), ConfirmationError> {
         match policy {
             ConfirmationPolicy::SkipPrompt => {
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr, "Confirmation skipped by --yes.")
-                    .map_err(ConfirmationError::WriteStatus)?;
-                Ok(())
+                    .map_err(ConfirmationError::WriteStatus)
             }
             ConfirmationPolicy::RequireInteractive => {
                 let mut stderr = io::stderr().lock();
                 write!(
                     stderr,
-                    "Type CONFIRM to sign and submit this bridge intent for {} USDC: ",
-                    intent.amount
+                    "Type CONFIRM to sign and submit this bridge intent for {amount} USDC: "
                 )
                 .map_err(ConfirmationError::WritePrompt)?;
                 stderr.flush().map_err(ConfirmationError::FlushPrompt)?;
@@ -1772,7 +1770,7 @@ mod tests {
     impl IntentApprovalService for MockApprovalService {
         fn confirm(
             &self,
-            _intent: &BridgeIntent,
+            _amount: UsdcAmount,
             _policy: ConfirmationPolicy,
         ) -> Result<(), ConfirmationError> {
             self.calls.push("confirm");
