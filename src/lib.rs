@@ -753,19 +753,60 @@ where
 }
 
 trait IntentApprovalService {
-    fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()>;
+    fn confirm(
+        &self,
+        intent: &BridgeIntent,
+        policy: ConfirmationPolicy,
+    ) -> Result<(), ConfirmationError>;
+}
+
+#[derive(Debug)]
+enum ConfirmationError {
+    NotConfirmed,
+    WriteStatus(io::Error),
+    WritePrompt(io::Error),
+    FlushPrompt(io::Error),
+    ReadInput(io::Error),
+}
+
+impl std::fmt::Display for ConfirmationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotConfirmed => "bridge intent was not confirmed",
+            Self::WriteStatus(_) => "failed to write confirmation status",
+            Self::WritePrompt(_) => "failed to write confirmation prompt",
+            Self::FlushPrompt(_) => "failed to flush confirmation prompt",
+            Self::ReadInput(_) => "failed to read confirmation input",
+        })
+    }
+}
+
+impl std::error::Error for ConfirmationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotConfirmed => None,
+            Self::WriteStatus(error)
+            | Self::WritePrompt(error)
+            | Self::FlushPrompt(error)
+            | Self::ReadInput(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TerminalIntentApprovalService;
 
 impl IntentApprovalService for TerminalIntentApprovalService {
-    fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()> {
+    fn confirm(
+        &self,
+        intent: &BridgeIntent,
+        policy: ConfirmationPolicy,
+    ) -> Result<(), ConfirmationError> {
         match policy {
             ConfirmationPolicy::SkipPrompt => {
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr, "Confirmation skipped by --yes.")
-                    .wrap_err("failed to write confirmation status")?;
+                    .map_err(ConfirmationError::WriteStatus)?;
                 Ok(())
             }
             ConfirmationPolicy::RequireInteractive => {
@@ -775,29 +816,24 @@ impl IntentApprovalService for TerminalIntentApprovalService {
                     "Type CONFIRM to sign and submit this bridge intent for {} USDC: ",
                     intent.amount
                 )
-                .wrap_err("failed to write confirmation prompt")?;
-                stderr
-                    .flush()
-                    .wrap_err("failed to flush confirmation prompt")?;
+                .map_err(ConfirmationError::WritePrompt)?;
+                stderr.flush().map_err(ConfirmationError::FlushPrompt)?;
 
                 let mut input = String::new();
-                let bytes_read = io::stdin()
+                let _bytes_read = io::stdin()
                     .read_line(&mut input)
-                    .wrap_err("failed to read confirmation input")?;
-                if bytes_read == 0 {
-                    bail!("bridge intent was not confirmed");
-                }
+                    .map_err(ConfirmationError::ReadInput)?;
                 validate_confirmation_input(&input)
             }
         }
     }
 }
 
-fn validate_confirmation_input(input: &str) -> Result<()> {
+fn validate_confirmation_input(input: &str) -> Result<(), ConfirmationError> {
     if input.trim() == "CONFIRM" {
         Ok(())
     } else {
-        bail!("bridge intent was not confirmed");
+        Err(ConfirmationError::NotConfirmed)
     }
 }
 
@@ -1425,11 +1461,12 @@ mod tests {
     fn confirmation_input_requires_exact_confirm_token() {
         validate_confirmation_input("CONFIRM\n").expect("CONFIRM is accepted");
 
-        let error = validate_confirmation_input("confirm\n").expect_err("lowercase is rejected");
-        assert!(
-            error.to_string().contains("not confirmed"),
-            "unexpected error: {error}"
-        );
+        for input in ["", "confirm\n"] {
+            assert!(matches!(
+                validate_confirmation_input(input),
+                Err(ConfirmationError::NotConfirmed)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1733,7 +1770,11 @@ mod tests {
     }
 
     impl IntentApprovalService for MockApprovalService {
-        fn confirm(&self, _intent: &BridgeIntent, _policy: ConfirmationPolicy) -> Result<()> {
+        fn confirm(
+            &self,
+            _intent: &BridgeIntent,
+            _policy: ConfirmationPolicy,
+        ) -> Result<(), ConfirmationError> {
             self.calls.push("confirm");
             Ok(())
         }

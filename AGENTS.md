@@ -45,7 +45,10 @@ Use `nix develop -c cargo fmt` before committing Rust changes.
   asserted.
 - Never silently discard errors with `let _ =`. Propagate with `?`, handle with
   logging/reporting, or document why discarding is safe.
-- Use `eyre::WrapErr` at fallible external boundaries so errors name the failed
+- Use typed errors for domain and service failures callers need to distinguish.
+  Preserve underlying errors as sources and convert to `eyre::Report` at the
+  application boundary for CLI reporting.
+- Use `eyre::WrapErr` when adding context to a report so it names the failed
   operation: config loading, RPC parsing, provider checks, signer setup, fee
   resolution, transaction submission, attestation polling, and minting.
 - Use domain types at boundaries. Prefer `CctpV2Route`, `UsdcAmount`,
