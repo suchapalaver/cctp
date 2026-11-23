@@ -14,10 +14,8 @@ use crate::config::{
     ETHEREUM_SEPOLIA_RPC_ENV, EnvSource, HYPEREVM_RPC_ENV, sourced_required_cli_env_file,
 };
 use crate::routes::RouteConfig;
-use crate::{
-    BridgeArgs, BridgeRuntime, CctpBridgeRuntime, RelaySignerRuntime, TrezorWalletService,
-    WalletService,
-};
+use crate::wallet::{RelaySignerRuntime, TrezorWalletService, WalletService};
+use crate::{BridgeArgs, BridgeRuntime, CctpBridgeRuntime};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcEndpoints {
