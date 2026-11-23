@@ -760,37 +760,18 @@ trait IntentApprovalService {
     ) -> Result<(), ConfirmationError>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ConfirmationError {
+    #[error("bridge intent was not confirmed")]
     NotConfirmed,
-    WriteStatus(io::Error),
-    WritePrompt(io::Error),
-    FlushPrompt(io::Error),
-    ReadInput(io::Error),
-}
-
-impl std::fmt::Display for ConfirmationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotConfirmed => "bridge intent was not confirmed",
-            Self::WriteStatus(_) => "failed to write confirmation status",
-            Self::WritePrompt(_) => "failed to write confirmation prompt",
-            Self::FlushPrompt(_) => "failed to flush confirmation prompt",
-            Self::ReadInput(_) => "failed to read confirmation input",
-        })
-    }
-}
-
-impl std::error::Error for ConfirmationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::NotConfirmed => None,
-            Self::WriteStatus(error)
-            | Self::WritePrompt(error)
-            | Self::FlushPrompt(error)
-            | Self::ReadInput(error) => Some(error),
-        }
-    }
+    #[error("failed to write confirmation status")]
+    WriteStatus(#[source] io::Error),
+    #[error("failed to write confirmation prompt")]
+    WritePrompt(#[source] io::Error),
+    #[error("failed to flush confirmation prompt")]
+    FlushPrompt(#[source] io::Error),
+    #[error("failed to read confirmation input")]
+    ReadInput(#[source] io::Error),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
