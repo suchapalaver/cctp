@@ -304,7 +304,6 @@ where
         let relay_account = relay_signer.account;
         let source_signer_address = source_account.address;
         let relay = ResolvedRelay::from_config(config.relay, relay_account);
-        let workflow_relay = relay.workflow_relay();
         let recipient = config.recipient.resolve(source_signer_address);
 
         let providers =
@@ -347,7 +346,7 @@ where
 
         let runtime = self.provider_service.runtime(bridge, providers);
         let mut workflow = BridgeWorkflow::new(
-            BridgeWorkflowConfig::new(&config, resolved_transfer.transfer_mode(), workflow_relay),
+            BridgeWorkflowConfig::new(&config, resolved_transfer.transfer_mode(), relay.into()),
             runtime,
             source_signer_address,
             recipient,
@@ -426,9 +425,24 @@ enum CompletionOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkflowRelay {
+enum WorkflowRelay {
     WaitForRelayer { fallback: WorkflowRelayFallback },
     SelfRelay { submitter: Address },
+}
+
+impl From<ResolvedRelay> for WorkflowRelay {
+    fn from(relay: ResolvedRelay) -> Self {
+        match relay {
+            ResolvedRelay::WaitForRelayer { fallback } => Self::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: fallback.account().address,
+                },
+            },
+            ResolvedRelay::SelfRelay { account } => Self::SelfRelay {
+                submitter: account.address,
+            },
+        }
+    }
 }
 
 struct BridgeWorkflow<R> {
@@ -907,7 +921,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkflowRelayFallback {
+enum WorkflowRelayFallback {
     SelfRelay { submitter: Address },
 }
 
@@ -953,6 +967,7 @@ where
 mod tests {
     use super::*;
     use crate::routes::{ETHEREUM_SEPOLIA_USDC, MAINNET_USDC, ROUTE_CATALOG};
+    use crate::wallet::{RelayConfig, RelayFallbackConfig, WalletConfig};
     use alloy::primitives::address;
     use alloy_chains::NamedChain;
     use cctp_rs::FeeBps;
@@ -982,6 +997,31 @@ mod tests {
 
     fn empty_service() -> CliConfigService<TestEnv> {
         config_service(&[])
+    }
+
+    #[test]
+    fn resolved_relay_uses_fallback_account_for_wait_mode() {
+        let wallet = WalletConfig::Trezor { account: 0 };
+        let account = wallet.account_info(
+            WalletRole::DestinationRelay,
+            ChainArg::HyperEvm,
+            address!("0000000000000000000000000000000000000003"),
+        );
+        let relay = ResolvedRelay::from_config(
+            RelayConfig::WaitForRelayer {
+                fallback: RelayFallbackConfig::SelfRelay { wallet },
+            },
+            account,
+        );
+
+        assert_eq!(
+            WorkflowRelay::from(relay),
+            WorkflowRelay::WaitForRelayer {
+                fallback: WorkflowRelayFallback::SelfRelay {
+                    submitter: account.address
+                }
+            }
+        );
     }
 
     fn empty_args() -> BridgeArgs {

@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::provider::{BridgeContracts, ProviderChainCheck, ProviderValidation};
 use crate::routes::RouteConfig;
-use crate::wallet::{RelayPolicyLabel, ResolvedRelay, WalletAccount};
+use crate::wallet::{ResolvedRelay, WalletAccount};
 use crate::{
     ApprovalOutcome, BridgeOutcome, CompletionOutcome, FastFeeCapSource, ResolvedTransferMode,
     mode_label,
@@ -168,7 +168,7 @@ impl HumanReporter {
         println!("Fee cap source: {}", intent.provenance.max_fee);
         println!(
             "Relay: {} ({})",
-            intent.relay.label(),
+            relay_policy_label(intent.relay),
             intent.provenance.relay_mode
         );
         match intent.relay {
@@ -210,7 +210,7 @@ impl HumanReporter {
     fn report_wallet_account(&self, label: &str, account: &WalletAccount) {
         println!("{label} role: {}", account.role);
         println!("{label} wallet: {}", account.wallet);
-        println!("{label} derivation: {}", account.derivation_path);
+        println!("{label} derivation: {}", account.derivation_path());
         println!(
             "{label} chain: {} (chain id {})",
             account.chain_label(),
@@ -451,7 +451,7 @@ impl Serialize for JsonWalletAccount {
         let mut state = serializer.serialize_struct("JsonWalletAccount", 5)?;
         state.serialize_field("role", &JsonDisplay(account.role))?;
         state.serialize_field("wallet", &JsonDisplay(account.wallet))?;
-        state.serialize_field("derivation_path", &JsonDisplay(account.derivation_path))?;
+        state.serialize_field("derivation_path", &JsonDisplay(account.derivation_path()))?;
         state.serialize_field(
             "chain",
             &JsonChainIdentity {
@@ -506,8 +506,7 @@ struct JsonFastFee {
 #[derive(Serialize)]
 struct JsonRelayPolicy {
     mode: RelayMode,
-    #[serde(serialize_with = "serialize_display")]
-    policy: RelayPolicyLabel,
+    policy: &'static str,
     #[serde(serialize_with = "serialize_display")]
     source: ConfigValueSource,
     destination_provider: JsonDestinationProvider,
@@ -710,6 +709,15 @@ where
     }
 }
 
+const fn relay_policy_label(relay: ResolvedRelay) -> &'static str {
+    match relay {
+        ResolvedRelay::WaitForRelayer { .. } => {
+            "wait for any permissionless relayer, then self-relay fallback"
+        }
+        ResolvedRelay::SelfRelay { .. } => "self-relay on destination chain",
+    }
+}
+
 fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
     let relay_account = intent.relay.account();
     JsonBridgeIntent {
@@ -722,7 +730,7 @@ fn json_bridge_intent(intent: &BridgeIntent) -> JsonBridgeIntent {
         mode: json_transfer_mode(&intent.transfer),
         relay_policy: JsonRelayPolicy {
             mode: intent.relay.mode(),
-            policy: intent.relay.label(),
+            policy: relay_policy_label(intent.relay),
             source: intent.provenance.relay_mode,
             destination_provider: JsonDestinationProvider::SelfRelaySigner,
             fallback: match intent.relay {
